@@ -137,6 +137,31 @@ def write_bank(path, filters, S, L):
     return n, slot_len
 
 
+def load_bank(path, S, L):
+    """读磁盘 GFNC 库 (write_bank 产物) → filters: list of (S,L) float32.
+
+    供 `--labels` 独立跑时复用已生成的库 — 库槽按存储顺序返回,
+    打分标签 filter_idx 即库槽序, 与 C 端 scene_bank_load 一致.
+    """
+    with open(path, 'rb') as f:
+        hdr = f.read(16)
+    if len(hdr) < 16:
+        raise SystemExit(f'ERROR: {path} 不是有效 GFNC 库 (头 <16B)')
+    magic, version, n, slot_len = struct.unpack('<IIII', hdr)
+    if magic != BANK_MAGIC:
+        raise SystemExit(f'ERROR: {path} 不是 GFNC 库 (magic 0x{magic:08X})')
+    expect = S * L
+    if slot_len != expect:
+        raise SystemExit(f'ERROR: {path} slot_len={slot_len} != S*L={expect} — 与当前常量不符')
+    with open(path, 'rb') as f:
+        f.seek(16)
+        raw = np.frombuffer(f.read(n * slot_len * 4), dtype=np.float32)
+    if raw.size != n * slot_len:
+        raise SystemExit(f'ERROR: {path} 数据长度不完整 ({raw.size} < {n * slot_len})')
+    data = raw.reshape(n, S, L)
+    return [data[k].astype(np.float32) for k in range(n)], n
+
+
 def write_bank_info(path, filters_paths, n, slot_len, gain_scale, note=''):
     info = {
         'n_slots': n, 'slot_len': slot_len,
@@ -279,8 +304,9 @@ def main():
 
     if args.labels:
         if not filters:
-            raise SystemExit('ERROR: --labels 需先有库 — 同一命令给 --filters, '
-                             '或去掉 --filters 前先跑一次生成')
+            # 独立跑 --labels: 复用磁盘上已生成的库 (A1/B2 产物)
+            print(f'  [加载现有库] {args.out}')
+            filters, _ = load_bank(args.out, S, LEN_CTRL)
         if not args.wav_dir:
             raise SystemExit('ERROR: --labels 需要 --wav-dir (打分语料)')
         out_dir = Path(args.out).parent
