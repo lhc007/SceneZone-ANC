@@ -107,14 +107,19 @@ def main():
         wavfile.write(str(rep_path), FS, (rep * 32767).astype(np.int16))
         print(f'\n[类 {k}] 代表性宽带 → {rep_path} ({args.represent_sec:.0f}s)')
 
-        # 2) 训练样本: 白噪 → 类频带内随机带通 → 1s
+        # 2) 训练样本: 白噪 → 类频带内随机中心频率 + 随机带宽带通 → 1s
+        #    (SFANC-Window 原话: "filtering white noise through various bandpass filters
+        #     with randomly chosen center frequencies and bandwidths")
+        #    中心频率 = 类频带内对数均匀 (低频更密, 各类样本均衡);
+        #    带宽 = 随机 0.1~1.2×类带宽, 允许跨到相邻频带 (更贴近原论文的随机带宽),
+        #    标签仍 = 类 k (中心频率所在类带).
         cls_dir = out_dir / f'cls_{k}'
         cls_dir.mkdir(parents=True, exist_ok=True)
         for i in range(args.clips_per_class):
-            # 随机子带 [c_lo, c_hi] ⊂ [lo, hi], 宽度 ≥ 10% 带宽
-            min_bw = 0.1 * (hi - lo)
-            c_lo = rng.uniform(lo, hi - min_bw)
-            c_hi = rng.uniform(c_lo + min_bw, hi)
+            f_c = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+            half_bw = rng.uniform(0.1, 1.2) * (hi - lo) / 2.0
+            c_lo = max(BAND_LOW, f_c - half_bw)
+            c_hi = min(BAND_HIGH, f_c + half_bw)
             clip = bandpass_noise(c_lo, c_hi, 1.0, rng)
             p = cls_dir / f'{i:04d}.wav'
             wavfile.write(str(p), FS, (clip * 32767).astype(np.int16))
@@ -145,7 +150,8 @@ def main():
         'represent_sec': args.represent_sec,
         'fs': FS, 'order': ORDER, 'rms_target': RMS_TARGET,
         'seed': args.seed,
-        'method': 'SFANC-Window: white noise -> random bandpass within class band',
+        'method': 'SFANC-Window: white noise -> bandpass, center log-uniform in class band, '
+                  'random bandwidth 0.1-1.2x class width (may cross neighbor bands)',
     }
     info_path = out_dir / 'synth_noise_info.json'
     with open(info_path, 'w', encoding='utf-8') as f:
