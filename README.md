@@ -50,7 +50,7 @@
 |-----------|---------|
 | 从头训练 + 实时降噪（默认） | 阶段 0 → 1 → 2 → 3 → 4 全流程 |
 | 先用现成模型跑通（可选捷径） | 阶段 0 → 1 → 3 → 4（跳过训练 2；主路径测量可省） |
-| **部署态硬选库（SFANC 无误差麦开环）** | 阶段 0 → 1 → 2 → 3 → 4（训练核心 = 阶段 2：2-⓪ 生成带通 + 2-⑧ 造滤波器库（离线算 / 真机标定二选一）→ 打标签（真实语料 / 合成噪声二选一）→ 训分类 CNN → 导出） |
+| **部署态硬选库（SFANC 无误差麦开环）** | 阶段 0 → 1 → 2 → 3 → 4（训练核心 = 阶段 2：2-⓪ 生成带通 + 2-⑧ 造滤波器库（仿真离线算 / 实时真机标定 二选一）+ 自动打标签（全合成）→ 训分类 CNN → 导出） |
 
 **为什么先测声学路径再训练？** 库槽生成（阶段 2-⑧ 造库）以 `secondary_path.npy` 和 `primary_path.npy` 为输入（离线生成用它们做 FxLMS 收敛；真机标定也要用次级路径 Ŝ 起步闭环），所以**阶段 1 测声学路径必须排在训练之前**；环路延迟、反馈路径是纯部署项（训练用不到，阶段 1 里一起测完）。仓库 `data/` 也带一份训练好的权重，想先跑通再训练可跳过阶段 2——此时换硬件/摆放后要回到导出步重导一次让新测 Ŝ 生效。
 
@@ -217,7 +217,7 @@ cd ..
 
 > 输入依赖：阶段 1 测好的 `secondary_path.npy`（2-⑧ 全都要；真机标定、离线生成都要用它）。`primary_path.npy` 仅离线生成和离线评估需要，真机标定不加载主路径。**按顺序一条路走到底**：
 > - **2-⓪ 生成带通**：分类 CNN 输入与导出的 `bandpass_fir.bin` 同源。
-> - **2-⑧ 部署核心**：造滤波器库（离线算 / 真机标定二选一）+ 打标签（真实语料 / 合成噪声二选一）+ 训练分类 CNN（K=N argmax 选槽）+ 导出 `data/*.bin`，部署必做。
+> - **2-⑧ 部署核心**：造滤波器库（仿真离线算 / 实时真机标定 二选一）+ 自动打标签（全合成）+ 训练分类 CNN（K=N argmax 选槽）+ 导出 `data/*.bin`，部署必做。
 
 ```bash
 # 2-⓪ 生成带通 bandpass_fir.mat（CNN 输入 + 导出 bandpass_fir.bin 同源，50-1500Hz）
@@ -228,16 +228,16 @@ python export/gen_bandpass_fir.py --f-low 50 --f-high 1500
 
 **2-⑧ 生成滤波器库 + 训练分类 CNN（部署必做；只跑固定单滤波器时可跳过）**
 
-部署态工作方式：**噪声进来 → CNN 看一眼"这是哪种噪声" → 从库里挑一条对应滤波器来消**。所以部署需要**两样东西**，各有二选一、互相独立：
+部署态工作方式：**噪声进来 → CNN 看一眼"这是哪种噪声" → 从库里挑一条对应滤波器来消**。所以部署需要**两样东西**，本仓库按"全合成"一条路走（连库也用合成噪声，不用录音、不用真实语料）：
 
-| 要准备什么 | 方式① 真实噪声录音 | 方式② 合成噪声（推荐） |
-|-----------|---------------------|------------------------|
-| **N 条成品滤波器**（`data/wc_bank.bin`） | 你的录音 → 电脑离线算（`generate_bank.py --filters`）；或真机标定（`GFANC_CAL_INDEX`，需误差麦） | 合成器产 `band_k.wav` → 电脑离线算（`generate_bank.py --filters`） |
-| **一个 N 类分类 CNN**（部署时挑槽） | 真实语料打分（`generate_bank.py --labels`） | 合成标签 CSV（`generate_synthetic_noise.py` 自动写好） |
+| 要准备什么 | 怎么来（对应 SFANC-Window 仿真版 / 实时版） |
+|-----------|-----------------------------------------------|
+| **N 条成品滤波器**（`data/wc_bank.bin`） | 仿真版（=论文仿真，电脑离线算）：`band_k.wav` → `generate_bank.py --filters`；实时版（=论文实时实现，真机标定）：放 `band_k.wav` 收敛存槽 `GFANC_CAL_INDEX` |
+| **一个 N 类分类 CNN**（部署时挑槽） | 合成标签 CSV（①A `generate_synthetic_noise.py` 自动写好，或 ①B 对已有语料 `--labels` 打分，类 k ↔ 频带 k ↔ 库槽 k） |
 
 > 💡 **滤波器两条路的本质区别（你最纠结的点，一句话讲清）**：
 >
-> | | 电脑离线算（造库默认） | 真机收敛标定（可选） |
+> | | 电脑离线算（仿真版） | 真机收敛标定（实时版） |
 > |---|---|---|
 > | 路径从哪来 | 用测量存的 `.npy`（测那一刻的 `secondary_path.npy`/`primary_path.npy`） | 用**现场实时**的路径（现在这一刻的 Ŝ、现在的摆放） |
 > | 噪声从哪来 | 你喂的 **wav 文件**（`--filters` 后面那几段） | 现场**实际播放的噪声**（参考麦实时拾取） |
@@ -245,51 +245,55 @@ python export/gen_bandpass_fir.py --f-low 50 --f-high 1500
 > | 要不要放噪声 | ❌ **不用**——已有路径文件就直接算 | ✅ **必须放**（稳态宽带噪声，独立声源放） |
 > | 准度上限 | 被 `.npy` 的测量误差锁死 | 无 `.npy` 误差，更贴近部署实况 |
 >
-> 所以：**"已有路径了干嘛还放噪声？"——不放噪声的就是离线算。** 真机标定放噪声不是"为了获得噪声"，而是为了**绕开 `.npy` 用现场真路径收敛**（那才是"真机收敛更准"的原因）。省事选离线算，要最准选真机标定。
+> 所以：**"已有路径了干嘛还放噪声？"——不放噪声的就是离线算。** 真机标定放噪声不是"为了获得噪声"，而是为了**绕开 `.npy` 用现场真路径收敛**（那才是"真机收敛更准"的原因）。两档对应论文**仿真版 / 实时实现版**：有误差麦选实时版（最贴论文部署），没误差麦/纯电脑算选仿真版。
 
-> 📌 **两条路线各是一条完整流水线（①→④），选一条跑到底**；造库的"离线算/真机标定"是方式① 里的一个可选开关。要跟开源 SFANC-Window 完全一致 = **真机标定造库 + 方式② 合成标签**。若只需单一静态滤波器（N=1 库），跳过本节，部署自动回退静态槽。下面每条流水线按 ①→④ 顺序给命令。
+> 📌 **本节一条完整流水线（①→④）**：CNN 用合成噪声训练；滤波器造库**分两档，对应 SFANC-Window 论文仿真版 / 实时版**——仿真版电脑离线算、实时版真机放 `band_k` 收敛存槽，类 k ↔ 频带 k ↔ 库槽 k 由 `band_k.wav` 对齐。语料两路：**①A 生成器自产**（默认，生成样本 + 顺手写标签）或 **①B 复用已有合成语料**（不生成样本，`pick_band_reps.py` 挑 N 条频带代表造库 + `--labels` 打分写标签，适合已有 SFANC-Window 同源数据集）。若只需单一静态滤波器（N=1 库），跳过本节，部署自动回退静态槽。
 
 ```bash
-# ════════════════ 方式① 真实噪声录音流水线（你有现成录音/语料时用）════════════════
-# ── ① 造滤波器库：一段代表噪声 → 一条成品滤波器 → 一个库槽 ──
-#     f_*.wav = 你自己的噪声录音路径（想消什么噪声就喂什么；槽序 == --filters 顺序 == 标签 k）
-python export/generate_bank.py --filters f_road.wav f_fan.wav f_voice.wav -o data/wc_bank.bin
-#     马上能试: 用仓库自带的真实噪声样本（Noise Examples/ 里就是各形态噪声录音, 文件带空格要加引号）
-python export/generate_bank.py --filters "Noise Examples/Furniture.wav" "Noise Examples/Helicopter.wav" "Noise Examples/road_noise-15.wav" "Noise Examples/Handheld drill.wav" -o data/wc_bank.bin
-#     可选替代——真机收敛标定（需误差麦，编译后运行；绕开 .npy 用现场真路径收敛，更贴近部署实况）：
-$env:GFANC_CAL_INDEX='0'; .\scenezone_realtime.exe   # 放噪声形态 0, 收敛后自动 [SAVE] 存槽 0, 然后 Ctrl+C
-$env:GFANC_CAL_INDEX='1'; .\scenezone_realtime.exe   # 换噪声形态 1, 存槽 1, 然后 Ctrl+C
+# ────────── 第①步：语料来源（方式 A 默认 / 方式 B 复用已有合成语料，二选一）──────────
+# 方式 A（默认）：合成 N 类样本 + 自动写标签 CSV。
+#   白噪过随机带通 → N 类噪声样本；类 k ↔ 频带 k ↔ 库槽 k 语义对齐。
+#   产出 band_k.wav（每类代表宽带，供②造库）+ cls_k/*.wav（1s 训练样本）
+#      + data/bank_labels_{train,valid}.csv（K=N 标签）
+python export/generate_synthetic_noise.py --n-classes 7 --clips-per-class 2000
+#     （N 改多少，② --filters-dir 就自动造几个槽，不用手工改）
+#
+# 方式 B（复用已有合成语料，如 SFANC-Window 同源 7.5 万条 D:\Dataset\Synthetic_Dataset）：
+#   不生成样本。自动按频谱质心分 N 个对数频带、每带挑 1 条代表 → data/synth_noise/band_0..N-1.wav
+#   标签在②造好库后补一步（见②下方 ②B 行）：
+python export/pick_band_reps.py --wav-dir D:\Dataset\Synthetic_Dataset --n-reps 7
+
+# ────────── 第②步：造滤波器库（仿真版 / 实时版 二选一，对应论文两版）──────────
+# 仿真版（=论文仿真；电脑离线算，无需误差麦）：自动读 synth_noise_info.json 展开 band_0..N-1.wav → N 个库槽
+python export/generate_bank.py --filters-dir data/synth_noise -o data/wc_bank.bin
+# ②B 方式 B 打标：对已有语料逐条选最优消噪槽 → bank_labels_{train,valid}.csv（K=N 从库槽数来）
+#   ⚠️ 重计算：--max-files 抽几千~几万条即可，别给全 6 万条打分；必须在②造好库后跑：
+python export/generate_bank.py --labels --wav-dir D:\Dataset\Synthetic_Dataset\Training_data --max-files 20000 -o data/wc_bank.bin
+# 实时版（=论文实时实现；真机收敛标定，需误差麦）：放 band_k.wav → 现场 FxLMS 收敛 → 自动 [SAVE] 存槽 k → Ctrl+C
+#   N 个槽就放 N 次：GFANC_CAL_INDEX 从 0 跑到 N-1，每个槽放对应 band_k.wav（下面示例是 N=4，N=7 就跑到 6）
+#   前置：先编译实时版 exe（阶段 3）+ data/ 有路径/带通 .bin（仓库自带或第④步导出的）
+$env:GFANC_CAL_INDEX='0'; .\scenezone_realtime.exe   # 放 data/synth_noise/band_0.wav, 收敛存槽 0
+$env:GFANC_CAL_INDEX='1'; .\scenezone_realtime.exe   # 放 data/synth_noise/band_1.wav, 收敛存槽 1
+$env:GFANC_CAL_INDEX='2'; .\scenezone_realtime.exe   # 放 data/synth_noise/band_2.wav, 收敛存槽 2
+$env:GFANC_CAL_INDEX='3'; .\scenezone_realtime.exe   # 放 data/synth_noise/band_3.wav, 收敛存槽 3
 Remove-Item Env:GFANC_CAL_INDEX                       # 清环境变量, 回到默认槽 0
-# ── ② 打分造标签：对①的库，给 --wav-dir 语料每段 1s 噪声打分 → filter_idx 标签 ──
-python export/generate_bank.py --labels --wav-dir D:\你的噪声语料目录 -o data/wc_bank.bin
-#     造库+打分也可合并成一条命令（--filters 在前，自动先造库再打分）：
-#     python export/generate_bank.py --filters f_road.wav f_fan.wav f_voice.wav --labels --wav-dir D:\你的噪声语料目录 -o data/wc_bank.bin
-# ── ③ 训练分类 CNN（吃②的标签；大语料在这里——判别器要多而杂的噪声样本学会"这段谱形该选第 k 条滤波器"）──
+
+# ──────────────── 第③步：训练分类 CNN（吃第①步的标签 CSV）────────────────
+# 大语料在这里——判别器要多而杂的噪声样本学会"这段谱形该选第 k 条滤波器"
 # ⚠️ 必须显式传 --train/--valid 指向仓库根 data/（脚本默认找 SceneZone_Scene/data/，会找不到上面的 CSV）
-python SceneZone_Scene/training/network/train_real_bank_cnn.py \
-  --train data/bank_labels_train.csv --valid data/bank_labels_valid.csv
+python SceneZone_Scene/training/network/train_real_bank_cnn.py `
+  --train data/bank_labels_train.csv `
+  --valid data/bank_labels_valid.csv
+
 #    → SceneZone_Scene/models/MIMO_M5_Scene_Bank.pth (K=N 从标签推导, 无语义类名)
-# ── ④ 导出 C 二进制（把模型转成 C 端 .bin）──
+
+# ──────────────── 第④步：导出 C 二进制（把模型转成 C 端 .bin）────────────────
+# 导出分类 CNN 权重 cnn_bank_*.bin + 声学路径 + 带通 + 批次指纹 + 配置（K 从 ckpt 推导）
 # ⚠️ 全程在仓库根目录跑, 不要 cd .. — export_bin.py 用绝对路径定位, 不依赖 cwd
 python export/export_bin.py                       # → data/*.bin + cnn_bank_info.json (mode=classification)
 #    默认自动查找同级目录的 SceneZone_Scene；不同目录用 set GFANC_PYTHON_PROJ=D:\你的路径\SceneZone_Scene
-
-# ════════════════ 方式② 合成噪声流水线（推荐，不用录音，PC 一条龙）════════════════
-# ── ① 合成 N 类样本 + 自动写标签 CSV：白噪过随机带通，类 k ↔ 频带 k ↔ 库槽 k 语义对齐 ──
-python export/generate_synthetic_noise.py --n-classes 4 --clips-per-class 2000
-#    → data/synth_noise/band_0..3.wav（代表性宽带, 下面②当 --filters 用）
-#      + data/synth_noise/cls_k/*.wav（1s 训练样本）+ data/bank_labels_{train,valid}.csv（K=N 标签）
-#      （N 改多少，②的 --filters 就列几个 band_k.wav）
-# ── ② 造滤波器库：喂①的 band_k.wav（顺序即槽序: band_0 → 槽 0）──
-python export/generate_bank.py --filters data/synth_noise/band_0.wav data/synth_noise/band_1.wav data/synth_noise/band_2.wav data/synth_noise/band_3.wav -o data/wc_bank.bin
-# ── ③ 训练分类 CNN（同方式① ③，吃①的标签 CSV）──
-python SceneZone_Scene/training/network/train_real_bank_cnn.py \
-  --train data/bank_labels_train.csv --valid data/bank_labels_valid.csv
-#    → SceneZone_Scene/models/MIMO_M5_Scene_Bank.pth
-# ── ④ 导出 C 二进制（同方式① ④）──
-python export/export_bin.py                       # → data/*.bin + cnn_bank_info.json (mode=classification)
 ```
-> ⚠️ 重计算（离线 FxLMS 收敛 + 打分）较耗时，脚本打印进度；60s 收敛 ≈ 15s/滤波器。**绝对增益已烘焙进库槽**（非归一化）——部署前用 `main.exe` 验证 NR_true，若整库幅度整体偏差用 `--gain-scale` 缩放重生成。
+> ⚠️ 实时版逐槽放噪声收敛（每槽约几十秒~分钟）；仿真版离线算较耗时（60s 收敛 ≈ 15s/滤波器，脚本打印进度）。**绝对增益已烘焙进库槽**（非归一化）——部署前用 `main.exe` 验证 NR_true，若整库幅度整体偏差用 `--gain-scale` 缩放重生成。
 
 ### 🎯 编译（阶段 3 — 必做）
 
@@ -387,7 +391,7 @@ SceneZone-ANC/
 └── export/                工具脚本（Python → C 格式转换）
     ├── export_bin.py      导出 C .bin（分类 CNN cnn_bank_*.bin + 路径 + 带通 + 指纹）
     ├── gen_bandpass_fir.py 生成带通 bandpass_fir.mat（阶段 2-⓪）
-    ├── generate_bank.py    离线生成 SFANC 硬选库 + 打分打标签（阶段 2-⑧）
+    ├── generate_bank.py    离线生成 SFANC 硬选库（阶段 2-⑧；--labels 打分打标签为真实录音路线备选）
     ├── generate_synthetic_noise.py  合成噪声（SFANC-Window 同款, 按频带定类, 阶段 2-⑧ 可选）
     └── measure_*.py        声学路径测量（阶段 1）
 ```

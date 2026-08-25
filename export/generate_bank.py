@@ -12,6 +12,9 @@
      --filters 的文件 = 你自己准备的噪声录音 (想消什么噪声就喂什么), 脚本不生成、仓库不附带;
      每段噪声经离线 FxLMS 收敛出一条全频段成品滤波器, 写一个库槽。可先用
      "Noise Examples/" 下的真实噪声样本试跑 (文件名带空格要加引号)。
+  A') 合成管线自动版 (免手工列 N 条): 自动读 synth_noise_info.json 的 n_classes,
+      展开 band_0..N-1.wav — generate_synthetic_noise.py 里 --n-classes 改多少这里不用动:
+     python export/generate_bank.py --filters-dir data/synth_noise -o data/wc_bank.bin
   B) 打分打标签 (给分类 CNN 训通用 N 类): 每段 1s 噪声对 N 条候选滤波器算残差功率,
      argmin 当标签 (MIMO-SFANC generate_dataset_v2 法):
      python export/generate_bank.py --labels --wav-dir <含wav目录> -o data/wc_bank.bin
@@ -211,9 +214,15 @@ def score_slot_for_clip(wave, filters, Pri, Sec, fs=FS, trim_samples=LEN_CTRL):
     return int(torch.argmin(resid).item()), resid.tolist()
 
 
-def score_corpus(wav_dir, filters, Pri, Sec, out_csvs, fs=FS, valid_frac=0.15, seed=0):
-    """扫描 wav_dir 全部 *.wav (取前 1s), 逐段打 best-filter 标签. 写 train/valid CSV."""
+def score_corpus(wav_dir, filters, Pri, Sec, out_csvs, fs=FS, valid_frac=0.15, seed=0,
+                 max_files=None):
+    """扫描 wav_dir 全部 *.wav (取前 1s), 逐段打 best-filter 标签. 写 train/valid CSV.
+
+    max_files: 抽样上限 — 打分重计算, 大语料 (如 6 万条) 抽几千~几万条即可, 没必要全打.
+    """
     files = sorted(p for p in Path(wav_dir).rglob('*.wav'))
+    if max_files:
+        files = files[:max_files]
     if not files:
         raise SystemExit(f'ERROR: {wav_dir} 下无 *.wav')
     rng = np.random.RandomState(seed)
@@ -254,9 +263,14 @@ def main():
         description='离线生成 SFANC 硬选库 (N 条固定滤波器) + 分类 CNN 打标签')
     ap.add_argument('--filters', nargs='+', default=None,
                     help='N 段代表性噪声 WAV, 每段 → 一条滤波器 (库槽 k)')
+    ap.add_argument('--filters-dir', default=None,
+                    help='合成噪声目录 (含 band_0..N-1.wav + synth_noise_info.json): '
+                         '自动按 n_classes 展开全部 band 代表噪声, 免手工列 N 条')
     ap.add_argument('--labels', action='store_true',
                     help='对 --wav-dir 下 1s 噪声打分, 写分类 CNN 训练标签')
     ap.add_argument('--wav-dir', default=None, help='打分语料目录 (任意噪声, 无需语义类别)')
+    ap.add_argument('--max-files', type=int, default=None,
+                    help='打分语料抽样上限 (重计算; 大语料抽几千~几万条即可, 默认全打)')
     ap.add_argument('-o', '--out', default=str(_PROJECT_ROOT / 'data' / 'wc_bank.bin'),
                     help='库输出路径 (默认 data/wc_bank.bin)')
     ap.add_argument('--info', default=None,
@@ -269,8 +283,28 @@ def main():
                     help='打分切分的验证集比例')
     args = ap.parse_args()
 
+    # --filters-dir 自动展开: 读 synth_noise_info.json 的 n_classes, 展开 band_0..N-1.wav.
+    # 生成器 --n-classes 改多少, 这里都不用跟着改 (N 从 info 自动来).
+    if args.filters_dir:
+        d = Path(args.filters_dir)
+        n_classes = None
+        info_path = d / 'synth_noise_info.json'
+        if info_path.exists():
+            with open(info_path, encoding='utf-8') as f:
+                n_classes = json.load(f).get('n_classes')
+        if not n_classes:
+            n_classes = len(sorted(d.glob('band_*.wav')))
+        if not n_classes:
+            raise SystemExit(
+                f'ERROR: {args.filters_dir} 下无 band_*.wav 或 synth_noise_info.json — '
+                f'先跑 export/generate_synthetic_noise.py')
+        args.filters = [str(d / f'band_{k}.wav') for k in range(n_classes)]
+        for p in args.filters:
+            if not Path(p).exists():
+                raise SystemExit(f'ERROR: 缺 {p} — 先跑 export/generate_synthetic_noise.py')
+
     if not args.filters and not args.labels:
-        raise SystemExit('ERROR: 至少给 --filters 或 --labels')
+        raise SystemExit('ERROR: 至少给 --filters / --filters-dir 或 --labels')
 
     Pri, Sec = _load_paths()
     E, R, L_pri = Pri.shape
@@ -313,7 +347,7 @@ def main():
         K = score_corpus(args.wav_dir, filters, Pri, Sec,
                          [str(out_dir / 'bank_labels_train.csv'),
                           str(out_dir / 'bank_labels_valid.csv')],
-                         valid_frac=args.valid_frac)
+                         valid_frac=args.valid_frac, max_files=args.max_files)
         print(f'\n  分类 CNN 训练标签就绪 (K={K})。下一步:')
         print(f'    python SceneZone_Scene/training/network/train_real_bank_cnn.py')
 

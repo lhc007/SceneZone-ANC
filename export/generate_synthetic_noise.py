@@ -159,10 +159,9 @@ def main():
     print(f'  信息: {info_path}')
 
     # 下一步命令链
-    rep_wavs = ' '.join(f'"{out_dir / f"band_{k}.wav"}"' for k in range(N))
     print('\n  下一步 (按顺序, 重计算由你跑):')
-    print(f'    1. 生成库槽 (类 k ↔ 槽 k, 顺序即槽序):')
-    print(f'       python export/generate_bank.py --filters {rep_wavs} -o data/wc_bank.bin')
+    print(f'    1. 生成库槽 (自动读 synth_noise_info.json 展开 band_0..{N-1}.wav):')
+    print(f'       python export/generate_bank.py --filters-dir {out_dir} -o data/wc_bank.bin')
     print(f'    2. 训分类 CNN (读上面的标签 CSV):')
     print('       python SceneZone_Scene/training/network/train_real_bank_cnn.py')
     print('    3. 导出 C 权重 + 刷新批次指纹:')
