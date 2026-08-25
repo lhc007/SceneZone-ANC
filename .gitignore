@@ -31,3 +31,6 @@ backup_*/
 # Claude Code (local)
 .claude/
 .agents/
+
+#dataSet
+data/synth_noise
