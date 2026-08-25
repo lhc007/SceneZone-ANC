@@ -1,5 +1,5 @@
 {
-  "K": 4,
+  "K": 7,
   "input_len": 16000,
   "stem_out": 64,
   "stem_kernel": 80,
@@ -16,7 +16,7 @@
   "pool_kernel": 4,
   "pool_stride": 4,
   "fc_in": 64,
-  "fc_out": 4,
+  "fc_out": 7,
   "bn_eps": 1e-05,
   "mode": "classification",
   "activation": "none",
@@ -24,6 +24,9 @@
     "filter_0",
     "filter_1",
     "filter_2",
-    "filter_3"
+    "filter_3",
+    "filter_4",
+    "filter_5",
+    "filter_6"
   ]
 }

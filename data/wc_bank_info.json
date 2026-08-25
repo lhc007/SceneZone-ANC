@@ -1,0 +1,19 @@
+{
+  "n_slots": 7,
+  "slot_len": 2048,
+  "S": 2,
+  "L": 1024,
+  "fs": 16000,
+  "format": "GFNC 16B 头 + n_slots × (S*L) float32 (同 C scene_bank.c)",
+  "source_wavs": [
+    "data\\synth_noise\\band_0.wav",
+    "data\\synth_noise\\band_1.wav",
+    "data\\synth_noise\\band_2.wav",
+    "data\\synth_noise\\band_3.wav",
+    "data\\synth_noise\\band_4.wav",
+    "data\\synth_noise\\band_5.wav",
+    "data\\synth_noise\\band_6.wav"
+  ],
+  "gain_scale": 1.0,
+  "note": "离线 FxLMS 收敛成品 (绝对增益, 符号 = C 部署)。部署前用 main.exe GFANC_OPEN_LOOP 验 NR_true。"
+}

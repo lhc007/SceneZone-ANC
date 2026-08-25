@@ -233,7 +233,7 @@ python export/gen_bandpass_fir.py --f-low 50 --f-high 1500
 | 要准备什么 | 怎么来（对应 SFANC-Window 仿真版 / 实时版） |
 |-----------|-----------------------------------------------|
 | **N 条成品滤波器**（`data/wc_bank.bin`） | 仿真版（=论文仿真，电脑离线算）：`band_k.wav` → `generate_bank.py --filters`；实时版（=论文实时实现，真机标定）：放 `band_k.wav` 收敛存槽 `GFANC_CAL_INDEX` |
-| **一个 N 类分类 CNN**（部署时挑槽） | 合成标签 CSV（方式 A 生成器自动写好，或方式 B 对已有语料 `--labels` 打分，类 k ↔ 频带 k ↔ 库槽 k） |
+| **一个 N 类分类 CNN**（部署时挑槽） | 合成标签 CSV（①A `generate_synthetic_noise.py` 自动写好，或 ①B 对已有语料 `--labels` 打分，类 k ↔ 频带 k ↔ 库槽 k） |
 
 > 💡 **滤波器两条路的本质区别（你最纠结的点，一句话讲清）**：
 >
@@ -346,6 +346,7 @@ Remove-Item Env:GFANC_ANC_MODE -ErrorAction SilentlyContinue   # 跑完回默认
   ```bash
   ./main.exe "Noise Examples/road_noise_0-34.wav"
   ./main.exe "Noise Examples/road_noise-15.wav"
+  ./main.exe "Noise Examples/tone250_30s.wav"
   ```
 
 ## 项目结构
