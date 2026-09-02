@@ -8,7 +8,7 @@ $exe       = ".\scenezone_realtime.exe"
 $bankDir   = "data\synth_noise"
 $ffplay    = Get-Command ffplay -ErrorAction SilentlyContinue
 
-function Play-Noise($k) {
+function Start-Noise($k) {
     $wav = "$bankDir\band_$k.wav"
     if (-not (Test-Path $wav)) { throw "文件不存在: $wav" }
     if ($ffplay) {

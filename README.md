@@ -62,7 +62,7 @@ pip install numpy scipy pandas torch torchaudio
 
 > **为什么先测？** 训练生成滤波器库需要知道“扬声器到误差麦的声音是怎么传的”，这就是次级路径 Ŝ。换了硬件或摆放位置必须重测。
 
-#### 1-① 编译校准程序
+#### 1.1 编译校准程序
 
 ```bash
 # 环路延迟测量
@@ -72,7 +72,7 @@ gcc -O2 -Iinclude src/calibrate_secondary.c -lm -o calibrate_secondary.exe
 gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 src/calibrate_feedback.c src/fir_filter.c src/binary_loader.c src/pa_loader.c -lm -lole32 -o calibrate_feedback.exe
 ```
 
-#### 1-② 测次级路径 Ŝ（必做）
+#### 1.2 测次级路径 Ŝ（必做）
 
 扬声器会发出扫频信号，误差麦接收，自动算出 `secondary_path.npy`。
 
@@ -85,7 +85,7 @@ cd ..
 
 > 产物：`SceneZone_Scene/Primary and Secondary Path/secondary_path.npy`
 
-#### 1-③ 测主路径 Pri（可选，离线评估用）
+#### 1.3 测主路径 Pri（可选，离线评估用）
 
 ```bash
 cd SceneZone_Scene
@@ -95,7 +95,7 @@ cd ..
 
 > 产物：`SceneZone_Scene/Primary and Secondary Path/primary_path.npy`
 
-#### 1-④ 测环路延迟（首次 / 换声卡后必做）
+#### 1.4 测环路延迟（首次 / 换声卡后必做）
 
 ```bash
 .\calibrate_secondary.exe
@@ -103,7 +103,7 @@ cd ..
 
 > 产物：`data/sec_bulk_delay.bin`
 
-#### 1-⑤ 测反馈路径（可选，防啸叫）
+#### 1.5 测反馈路径（可选，防啸叫）
 
 ```bash
 .\calibrate_feedback.exe
@@ -120,7 +120,7 @@ cd ..
 > - **仿真版**：电脑离线算，不用误差麦
 > - **真机标定版**：现场放噪声，用误差麦闭环收敛，效果更准
 
-#### 2-⓪ 生成带通
+#### 2.1 生成带通
 
 ```bash
 python export/gen_bandpass_fir.py --f-low 50 --f-high 1500
@@ -128,7 +128,7 @@ python export/gen_bandpass_fir.py --f-low 50 --f-high 1500
 
 > 产物：`SceneZone_Scene/models/bandpass_fir.mat`
 
-#### 2-⑧ 生成滤波器库（两种方法，二选一）
+#### 2.2 生成滤波器库（两种方法，二选一）
 
 ##### 方法 A：仿真版（电脑离线算）
 
@@ -153,7 +153,11 @@ python export/export_bin.py
 需要先把实时版编译出来（见阶段 3），然后对 7 个槽逐个标定。
 
 ```powershell
-# 槽 0：播放 data/synth_noise/band_0.wav，等 NR 稳定后按 Ctrl+C
+# 关键：先锁定标定模式。4.2 的 GFANC_ANC_MODE='fixed' 会留在本 PowerShell 窗口，
+# 不显式设回 adapt 会静默跑成部署（MODE=DEPLOY、不收敛、不存库）。
+$env:GFANC_ANC_MODE='adapt'
+
+# 槽 0：播放 data/synth_noise/band_0.wav，看到 [SAVE] 标定完成 后按 Ctrl+C
 $env:GFANC_CAL_INDEX='0'
 .\scenezone_realtime.exe
 
@@ -166,7 +170,7 @@ $env:GFANC_CAL_INDEX='6'
 .\scenezone_realtime.exe
 
 # 清理环境变量
-Remove-Item Env:GFANC_CAL_INDEX
+Remove-Item Env:GFANC_ANC_MODE,Env:GFANC_CAL_INDEX
 ```
 
 > 每跑完一次，系统会自动把收敛的滤波器保存到 `data/wc_bank.bin` 对应槽。  
@@ -176,13 +180,13 @@ Remove-Item Env:GFANC_CAL_INDEX
 
 ### 阶段 3：编译
 
-#### 3-① 编译实时版
+#### 3.1 编译实时版
 
 ```bash
 gcc -O2 -Iinclude -D_WIN32_WINNT=0x0601 main_realtime.c src/scene_controller.c src/scene_bank.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c src/howling_detect.c src/sec_online.c src/pa_loader.c -lm -lole32 -o scenezone_realtime.exe
 ```
 
-#### 3-② 编译离线评估版（可选）
+#### 3.2 编译离线评估版（可选）
 
 ```bash
 gcc -O2 -Iinclude main.c src/scene_controller.c src/scene_bank.c src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c -lm -o main.exe
@@ -192,17 +196,18 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/scene_bank.c src/fxnlms_mimo
 
 ### 阶段 4：运行
 
-#### 4-① 标定模式（需要误差麦）
+#### 4.1 标定模式（需要误差麦）
 
 ```powershell
+$env:GFANC_ANC_MODE='adapt'   # 锁标定（默认虽是 adapt，但 4.2 的 fixed 会残留，见 4.2 注意事项）
 .\scenezone_realtime.exe
 ```
 
-- 播放稳态噪声（如白噪、粉噪、马路噪音）
-- 看 log 里的 `NR` 数字，稳定后系统会自动保存
-- 按 `Ctrl+C` 退出
+- 播放稳态噪声（如白噪、粉噪、马路噪音，或 `data/synth_noise/band_k.wav`）
+- FxLMS 从零收敛，log 出 `[SAVE] 标定完成 …槽k` 表示已自动存库
+- **看到 `[SAVE]` 后再按 `Ctrl+C`**——提前按会提示"跳过: 未检测到收敛"，不保存
 
-#### 4-② 部署模式（不需要误差麦）
+#### 4.2 部署模式（不需要误差麦）
 
 ```powershell
 $env:GFANC_ANC_MODE='fixed'
@@ -212,6 +217,8 @@ $env:GFANC_ANC_MODE='fixed'
 - 系统会自动识别噪声类型，从库里挑选对应的滤波器
 - 每秒 log 会显示 `[BANK] 类=k/7`
 
+> ⚠️ `GFANC_ANC_MODE='fixed'` 会**一直残留**在当前 PowerShell 窗口。之后再跑 4.1 / 方法 B 标定前，先执行 `Remove-Item Env:GFANC_ANC_MODE`（或直接新开一个窗口），否则裸命令会静默跑成部署模式。
+
 ---
 
 ## 4. 快速验证系统是否正常
@@ -219,7 +226,7 @@ $env:GFANC_ANC_MODE='fixed'
 **用 250Hz 纯音验证标定链路**：
 
 1. 外部扬声器播放 250Hz 正弦波
-2. 跑标定模式：`.\scenezone_realtime.exe`
+2. 跑标定模式：`$env:GFANC_ANC_MODE='adapt'; .\scenezone_realtime.exe`
 3. 观察 log，如果 `NR` 能到 10dB 以上，说明系统正常
 
 > 部署模式没有 NR 指标，验证靠人耳听 + 看 `[BANK]` 类号是否跟着噪声变化。

@@ -406,7 +406,42 @@ MIMO FxLMS 算力 ∝ E×S×L,**与通道数平方级增长**(8spk/8mic = 64 条
 ## 参考资料
 
 - Lam, Shi, Gan, Elliott & Nishimura, "Active control of broadband sound through the open aperture of a full-sized domestic window", *Scientific Reports* 10, 2020. https://link.springer.com/article/10.1038/s41598-020-66563-z
-- Luo et al., "Real-time Implementation and Explainable AI Analysis of Delayless CNN-based Selective Fixed-filter Active Noise Control", *Mechanical Systems and Signal Processing*, 2024. 代码: https://github.com/lhc007/SFANC-Window (1 参考麦 + 4 扬声器 + 4 误差麦 + ShuffleNetV2 选 7 固定滤波器,开环前馈,误差麦仅训练用)
+- Luo et al., "Real-time Implementation and Explainable AI Analysis of Delayless CNN-based Selective Fixed-filter Active Noise Control", *Mechanical Systems and Signal Processing*, 2024. 代码: https://github.com/Luo-Zhengding/SFANC-Window (1 参考麦 + 4 扬声器 + 4 误差麦 + ShuffleNetV2 选 7 固定滤波器,开环前馈,误差麦仅训练用)
 - Ratering et al., "Wave-Domain Approach for Cancelling Noise Entering Open Windows", ICASSP 2022(误差麦无关的波域方法,模拟 <2kHz 全局 −10dB). https://ieeexplore.ieee.org/document/9746829
 - Zou et al., "Active sound radiation control with secondary sources at the edge of the opening", *Applied Acoustics*.
 - 相关: [SceneZone_综合审查报告_合并版.md](SceneZone_综合审查报告_合并版.md) §物理层瓶颈
+
+---
+
+## 附：宽带真机标定受因果限制的实测背书 + SFANC-Window 平台对照（2026-09-02）
+
+> 端到端实测确认 §3 因果预览缺口，并核对开源 SFANC-Window 真实运行架构：本项目方法与其**无结构性差距**，差距在**平台**（12ms PC 实时环路 vs 低延迟实时控制器）。
+
+### 实测（同一声卡 / 扬声器 / Ŝ / 代码，仅换标定激励）
+
+| 标定激励 | 结果 |
+|---|---|
+| band_3 宽带 215–349Hz（循环 ~60s） | NR 全程 ~2dB 不收敛，auto `[SAVE]` 跳过 |
+| 250Hz 纯音 | ~1s 收敛，NR 峰值 30dB，残差 0.23→0.02，`[SAVE]` OK 存槽3 |
+
+### deploy 端到端（250Hz 纯音，无误差麦，开环 fixed）
+
+CNN 250Hz → 防抖修正 `类=3/7` → 选槽3（crossfade）→ 固定 Wc 输出 anti≈0.34 → 误差麦 ch1 0.30→0.13 / ch2 0.24→0.09 / ch3 0.23→0.09 ≈ **7–8dB 开环可闻降噪**。
+→ **SFANC 硬选全链（标定→存库→CNN 分类→开环降噪）在窄带/周期信号上完整可用。**
+
+### SFANC-Window 真实运行架构（源码核对）
+
+| 项 | 实现 |
+|---|---|
+| 实时控制平台 | **PXI 实时控制器**（低延迟硬件 I/O）；笔记本只做 录 1s → CNN → UDP 发滤波器 ID（192.168.1.103:61557），**不碰实时音频** |
+| 声学几何 | 4 通道 ANC 窗：1 参考麦（窗外）+ 4 次级源 + 4 误差麦；窗外参考麦 → 窗平面提供声学预览 |
+| 7 条控制滤波器 | 真机以 7 段不同频段**宽带**噪声为主噪声收敛（= 本项目方法 B 同思路） |
+| 论文卖点 | **delayless**（低延迟实时） |
+
+### 结论
+
+1. 宽带槽真机标不动 = **预览 1.9ms ≪ 处理延迟 12.4ms（≈−10.5ms）**：band_3 宽带相关时间 ~7ms < 延迟 → 实时不可对消；纯音相关时间无限 → 可对消。与 §3 结论一致，与扬声器/时长/激励无关。
+2. 215–349Hz 同扬声器压纯音 30dB → 该频段扬声器足够；扬声器只约束 **<100Hz**（§3 S 滚降 @50Hz≈7dB；§5.2 需大行程喇叭）。
+3. 解法：
+   - 目标噪声含周期/窄带成分（电机/风扇/嗡声/发动机）→ 对该**真实噪声或代表单音**标定该槽，PC 即可交付可闻窄带降噪；
+   - 目标为纯宽带（窗外交通/风噪）→ 实时控制搬低延迟平台（RK3568+ALSA ~2ms 或 PXI）+ 参考麦给出 ≥ 延迟的预览；deploy 开环 CNN+库已是嵌入式形态（0.03 GMAC/s，§5.2 直接迁移）。
