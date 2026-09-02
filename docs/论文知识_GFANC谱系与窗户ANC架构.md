@@ -1,7 +1,7 @@
 # 论文知识总结 — GFANC 谱系与窗户 ANC 架构
 
 > **日期**: 2026-08-13 · **类型**: 第四类(论文知识: 各解决什么问题、用什么方式)
-> **相关**: [窗户ANC可行性-因果限制_实测_方案](窗户ANC可行性-因果限制_实测_方案.md)(可行性/落地) · [SceneZone_综合审查报告_合并版](SceneZone_综合审查报告_合并版.md)(审查) · [路线决策_真实噪声重训库与CNN对齐论文](路线决策_真实噪声重训库与CNN对齐论文.md)(2026-08-25, 论文办法 vs 本项目 CNN/库的差异落地)
+> **相关**: [窗户ANC可行性-因果限制_实测_方案](窗户ANC可行性-因果限制_实测_方案.md)(可行性/落地) · [SceneZone_综合审查报告_合并版](SceneZone_综合审查报告_合并版.md)(审查归档) · [无误差麦方案_与SFANC对照_路线分析 §12](无误差麦方案_与SFANC对照_路线分析.md)(2026-08-25 论文办法 vs 本项目 CNN/库的差异落地, 原独立决策文档并入)
 
 ---
 
@@ -32,20 +32,42 @@ SFANC(选固定滤波器,离散) → GFANC(生成滤波器,连续) → GFANC-Bay
 - **降噪数值**: 摘要**未给具体 dB**(只说"宽带+真实低频噪声满意降噪"),数值在付费正文图表。
 - **代码**: [SFANC-Window](https://github.com/Luo-Zhengding/SFANC-Window) **只开源推理**(CNN 选滤波器 + UDP),**训练固定滤波器/次级路径测量/结果评估都未开源**。
 
-### 1.2 GFANC 原论文（本项目的直接架构来源）
+#### 1.1a SFANC-Window 训练方法 —— 关键的两层结构（合并自原架构.md 草稿）
+
+**"滤波器类别怎么区分？"要分两层看，别混**:
+
+① **CNN 分类器 = 纯合成数据训练**：
+- 80,000 条 1s 噪声，全部是白噪声 → 随机带通滤波器生成的合成噪声
+- 每类标签 = 一个频带范围（class k ↔ 频带 k）
+- 输入是 **2D CNN（Modified_ShuffleNetV2, num_classes=7）**：Mel 频谱图（1s → MelSpectrogram → 64×32 灰度图），非时域波形
+- 用 ImageNet 预训练 shufflenet_v2_x0_5 微调
+
+② **7 条控制滤波器 = 真实声学收敛**：
+- 论文 README 原文: *"7 pre-trained control filters are obtained in the 4-channel ANC window... 7 broadband noises with different frequency ranges are used as primary noises"*
+- 即 7 条滤波器在真实 ANC 窗户硬件上，用 7 段不同频段宽带噪声做主噪声，逐段离线/在线 FxLMS 收敛得到——**滤波器真实（经真实声学路径），驱动它们的噪声是合成的**
+- 类 k ↔ 滤波器 k 通过 **频带对齐**：第 k 类合成噪声的频带 = 第 k 条滤波器训练的噪声频带
+
+**对本项目的影响 —— 架构选择不必复制，数据生成已对齐**：
+- 论文是 2D CNN(Mel 图)，本项目是时域 **1D CNN（m5_scene）**吃 16000 样本波形。架构不同，但**核心 = 复刻它的数据生成方法**（`generate_synthetic_noise.py`：白噪→butter 带通、按频带定类），这一层已经对齐
+- 现有对照:合成方法(白噪→带通)✅ / 标签(按频带定类)✅ / 训练规模(可调) / 每类滤波器(→ band_k.wav 喂槽)✅
+- 论文标题对上了: *Real-time Implementation and Explainable AI Analysis of Delayless CNN-based Selective Fixed-filter ANC*（MSSP 2024）。核心贡献与本项目一致: **delayless**(无逐样本在线自适应,CNN 慢速选滤波器) + **selective fixed-filter**(固定滤波器库+选择=SFANC 硬选) + Markov 理论 + LayerCAM 可解释性。数据/训练方法没有额外的东西。
+
+> ⚠️ 2D ShuffleNetV2 vs 本项目 1D m5_scene 的完整差异对照与"换库后 CNN 是否失效"判据，已并入 [无误差麦方案 §12](无误差麦方案_与SFANC对照_路线分析.md)（2026-08-25 决策分析）。
+
+### 1.2 GFANC 原论文（曾为本项目 direct-weight 线的来源，2026-08-22 移除）
 
 - **核心**: 完美重构滤波器组把预训练宽带滤波器分解成**子滤波器库(sub-filter bank)**;1D CNN 输出**组合权重**,线性组合生成任意滤波器。
 - **关键性质**: **路径(子滤波器) 与 噪声(CNN 组合权重) 解耦** → 换环境只重标定子滤波器,CNN 不变(迁移性好)。
 - **双速率**: CNN 帧率(协处理器) + 控制器采样率,delayless。
-- 本项目 direct-weight 架构(CNN 生成 K=30 子带 gains → 组合子滤波器 → Wc)就是 GFANC。
+- 本项目**曾**以 direct-weight 架构(CNN 生成 K=30 子带 gains → 组合子滤波器 → Wc)实现 GFANC；**2026-08-22 随"清理回归 CNN 线"移除**，现行只留 SFANC 硬选库。此处仅作谱系记录。
 
-### 1.3 GFANC-FxNLMS + OCG（本项目当前架构的论文版）
+### 1.3 GFANC-FxNLMS + OCG（曾落地于本项目，2026-08-22 移除）
 
 - **混合动机**: GFANC 快但不稳 / FxLMS 稳但慢,互补。
 - **混合的坑**: GFANC 每帧重新生成权重,微小变化也**重置 FxLMS** → 自适应被打断 → 震荡。
 - **解法**: **在线聚类(OCG)**——CNN 预测权重做多质心聚类,**只有簇索引真变(噪声类别真切换)才更新滤波器**,簇内抖动不触发重置。
 - **结果**: 飞机噪声 + 20-2000Hz 宽带下,有聚类版更平滑、误差更低;CNN 仅 0.21M 参数,只需 1 个预训练宽带滤波器。
-- **对应本项目**: `ocg.c`(tau/alpha/max_clusters/hold) 即此模块,已实机验证(250↔1000 双向真切换+簇复用+零 rescue)。
+- **对应本项目**: 曾以 `ocg.c`(tau/alpha/max_clusters/hold) 实机验证(250↔1000 双向真切换+簇复用+零 rescue)；**2026-08-22 随"清理回归 CNN 线"整体移除**，现行只保留 SFANC 硬选库单一架构（见 README / 无误差麦方案文档）。
 
 ### 1.4 Unsupervised-GFANC（开环转型最省标签的路）
 
@@ -58,26 +80,28 @@ SFANC(选固定滤波器,离散) → GFANC(生成滤波器,连续) → GFANC-Bay
 
 ## 二、本项目在谱系中的位置
 
-**已实现(超出论文)**:
+> ⚠️ **现状注(2026-08-22 后)**: 现行架构 = **SFANC 硬选库单一架构**(对标 SFANC-Window):CNN(K=7) argmax 每秒选 1/7 成品槽 → crossfade,无误差麦部署(fixed 开环);标定 = 真机 adapt 逐槽收敛(FxLMS 仍用,见 [无误差麦方案 §11](无误差麦方案_与SFANC对照_路线分析.md))。下表"已实现"按**历史曾落地 + 现行仍留**两类标注——回归 CNN/连续权重线已整体移除,仅作谱系记录。
 
-| 组件 | 实现 |
-|---|---|
-| GFANC generative(子滤波器库+CNN 组合权重) | `cnn_m5_forward.c` + direct-weight |
-| FxLMS 闭环自适应 | `fxnlms_mimo.c`(VS-LMS/自适应 leak/anti-windup) |
-| OCG 在线聚类 | `ocg.c` |
-| 在线次级路径辨识 | `sec_online.c` |
-| 反馈对消 | `calibrate_feedback.c`(实机发散暂弃) |
-| 啸叫检测/安静检测/发散救援 | `howling_detect.c` + P0-5 等(**论文没有**的工程加固) |
+**曾落地 / 现行保留**:
 
-**还差的(及其对实际降噪的作用)**:
+| 组件 | 对应论文 | 现行状态(2026-08-22 后) |
+|---|---|---|
+| FxLMS 闭环自适应 | GFANC-FxNLMS | ✅ 保留:标定(adapt)用;VS-LMS/自适应 leak/anti-windup 在 `fxnlms_mimo.c` |
+| 在线次级路径辨识 | — | ✅ 保留(`sec_online.c`);标定支路,部署开环不用 |
+| 啸叫检测/安静检测/发散救援 | **论文没有**的工程加固 | ✅ 保留(`howling_detect.c` 等) |
+| GFANC generative(子滤波器库+CNN 组合权重 = direct-weight) | GFANC / GFANC-Bayes | ❌ **2026-08-22 移除**,现行只留 SFANC 硬选 |
+| OCG 在线聚类 | GFANC-FxNLMS+OCG | ❌ **2026-08-22 移除** |
+| 反馈对消 | — | ❌ 实机发散暂弃(`calibrate_feedback.c` 仅标定工具残留) |
+| 在线 Wc 自适应→连续组合 | Unsupervised-GFANC(理念) | ❌ 同上移除 |
 
-| 差的部分 | 作用 |
-|---|---|
-| Unsupervised 无监督训练(现在打标签监督) | 小:省标签工程+可能小幅提升,不改推理架构 |
-| GFANC-Bayes/Kalman 帧间平滑 | 无:OCG 已替代(同一问题不同解法) |
-| GFANC-RL 强化学习 | 小:训练范式,不直接改降噪量 |
-| **多通道窗户扩展(8spk/8mic MIMO)** | **决定性**:窗户开口降噪需空间采样,当前 E=3 S=2 只验证了算法 |
-| **开环转型(CNN 训练目标: 初始W→最优W)** | **决定性**:拆 FxLMS 闭环后 CNN 须直接生成最优解,否则降噪掉 |
+**还差的(对实际降噪的作用,与现行路线关系)**:
+
+| 差的部分 | 作用 | 现行路线是否触及 |
+|---|---|---|
+| Unsupervised 无监督训练(现在打标签监督) | 小:省标签工程,不改推理架构 | 未触及(仍监督训练 CNN) |
+| GFANC-Bayes/Kalman 帧间平滑 | 无:OCG 已替代(同一问题不同解法) | 已随 OCG 移除,不再需要 |
+| **多通道窗户扩展(8spk/8mic MIMO)** | **决定性**:窗户开口降噪需空间采样;当前 3麦2扬(标定)只验证了算法 | 远期目标板,见 [板级硬件定制需求](板级硬件定制需求_8S8E_闭环.md) |
+| 开环能消**宽频带/近均匀**噪声 | 硬选窄带槽一次只消一档,马路噪声被摊平 → NR 受限 | 已用**真机标定槽**(合成/真实宽带标定信号)缓解,见 [无误差麦方案 §12](无误差麦方案_与SFANC对照_路线分析.md) |
 
 ---
 

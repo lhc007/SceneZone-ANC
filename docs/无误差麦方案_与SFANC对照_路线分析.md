@@ -4,7 +4,9 @@
 >
 > 本文整理自 8x8 实时性讨论的延续：PXI 用途澄清 → SFANC 架构对照 → 开环精准度拆解 → 硬选 vs 连续权重 → 无误差麦路线。
 >
-> **后续决策**: 马路噪声离线 NR 10→4dB 回归分析 + 真实噪声重训库/CNN 对齐论文的路线选择，见 [路线决策_真实噪声重训库与CNN对齐论文](路线决策_真实噪声重训库与CNN对齐论文.md)（2026-08-25）。
+> **后续决策**: 马路噪声离线 NR 10→4dB 回归分析 + 真实噪声重训库/CNN 对齐论文的路线选择，已并入本文档 §12（原独立文档 2026-08-25）。
+>
+> ⚠️ **状态声明 (2026-09-02)**: 本文写于 2026-08-21 规划期，正文 §1-§10 讨论的"连续权重 / 子滤波器库 / `scene_ctrl_construct_wc` 组合链 / 生成式 SFANC"是当时的**直接权重(DW)实现,2026-08-22 已整体移除**。现行架构 = **SFANC 硬选库**: CNN(K=7) argmax 每秒选 1/7 成品槽 → crossfade,deploy 开环 fixed,标定 = 真机 adapt 逐槽收敛填 `wc_bank.bin`。本文档作为**架构路线总文档**: §11 是 08-21 的"单槽 `wc_fixed` 双模式"中间形态（现状演进见 **§11.1**）;路线取舍落定见 **§12**。
 
 ---
 
@@ -84,7 +86,7 @@ SFANC 的链路：
 
 ### 3.3 一个关键事实：你的"µ=0"已经是 SFANC
 
-你的 README 已记录：**µ=0（固定 Wc，仅 CNN 初值）在 road_0-34 开环 +7.1dB**（[README.md:635](README.md#L635)、[README.md:693](README.md#L693)、[README.md:712](README.md#L712)）。
+你的旧 README 曾记录：**µ=0（固定 Wc，仅 CNN 初值）在 road_0-34 开环 +7.1dB**。该实测与"连续权重 vs 硬选"的能力对比，在 2026-08-25 转为硬选库后由 §12 重新量化（马路噪声 10→4dB 回归）。
 
 代码里的对应开关就是 `freeze_lms`（[include/fxnlms_mimo.h:16](include/fxnlms_mimo.h#L16)），置 1 后梯度更新整段被跳过（[src/fxnlms_mimo.c:240](src/fxnlms_mimo.c#L240) `if (!fx->freeze_lms)`）。
 
@@ -197,7 +199,7 @@ FIR 系数量化 16-bit 有 ~96dB 信噪比，8-bit 也就 ~0.5% 带内幅度误
 | Wc 导出固化 | main_realtime.c + scene_controller | 校准模式退出时把收敛后的 wc 写回 sub_filter 库 |
 | 标定流程 | 文档 + 上位机 | 安装/维护 SOP，误差麦转接即插即用 |
 
-**已具备、不用动的**：CNN 前向、子滤波器库、连续增益组合链（[src/scene_controller.c:67-78](src/scene_controller.c#L67-L78) `scene_ctrl_construct_wc`）、增益平滑。
+**已具备、不用动的（08-21 当时）**：CNN 前向、子滤波器库、连续增益组合链（[src/scene_controller.c:67-78](src/scene_controller.c#L67-L78) `scene_ctrl_construct_wc`）、增益平滑——**上述生成式符号 2026-08-22 已删**，现行只剩 `scene_ctrl_classify`（CNN 选槽）+ `scene_bank.c`（取 `wc_bank` 成品槽），见 §11.1。
 
 ---
 
@@ -205,14 +207,14 @@ FIR 系数量化 16-bit 有 ~96dB 信噪比，8-bit 也就 ~0.5% 带内幅度误
 
 1. **开窗场景次级路径漂移量**：µ=0 开环 vs 闭环 FxLMS 各跑一段，量化漂移导致的 dB 退化。决定日常该信谁、校准频率该多高。
 2. **就地标定可复现性**：同一安装位置标定两次，固定滤波器差异是否在容差内（§4.2）。
-3. **1m 相干性**：沿用 8x8 预算表 §4/§5 的实测项（500Hz 相干≥0.8）。
+3. **1m 相干性**：沿用 [板级硬件定制需求_8S8E_闭环.md](板级硬件定制需求_8S8E_闭环.md) §11.4 的实测项（500Hz 相干≥0.8）。
 4. **切换瞬变**：连续增益下无此问题，但校准→运营切换时验证无爆音。
 
 ---
 
 ## 10. 参考
 
-- 讨论起点：`docs/8x8_实时性验收预算表.md`、`docs/窗户ANC可行性-因果限制_实测_方案.md`
+- 讨论起点：`docs/板级硬件定制需求_8S8E_闭环.md`（已并入原 8x8 实时性验收预算表）、`docs/窗户ANC可行性-因果限制_实测_方案.md`
 - SFANC 论文：Luo et al., *Real-time Implementation and Explainable AI Analysis of Delayless CNN-based Selective Fixed-filter ANC*, MSSP 2024. 代码：https://github.com/Luo-Zhengding/SFANC-Window
 - 生成式流派（你的连续权重对应的正统方案）：GFANC-Kalman、Unsupervised-GFANC、Deep Generative Fixed-filter ANC（他们 related works 列表）
 
@@ -231,3 +233,54 @@ FIR 系数量化 16-bit 有 ~96dB 信噪比，8-bit 也就 ~0.5% 带内幅度误
 - **实时（fixed 模式）**：err_meas 置 0（无误差麦）→ 派发恒走 `fxnlms_forward_rt`（无梯度/无Wc变更/无在线Ŝ）→ Wc 变更点（静音衰减、peak halve、冷启动 30% 软化）全 gate → 发散检测跳过
 - **遥测**：fixed 下 NR=n/a，CSV 事件列标 FIXED
 - **验证**：实时/离线编译通过；离线 adapt NR_true=14.7dB 与基线一致（无回归）；实机 fixed 振幅验证（GFANC_WC_TARGET=0.1→钳位0.05，原场景 ch1 0.19→0.06 ≈6dB；换场景相位不匹配反相 → 需标定滤波器）待定
+
+### 11.1 现状演进（2026-09-02）：单槽 wc_fixed → SFANC 硬选 7 槽库
+
+§11 描述的"单条全自动标定滤波器 `wc_fixed.bin`"是 08-21 的中间形态。之后的演进（见 CHANGELOG）：
+
+- **2026-08-22** 清理回归 CNN 线，只保留 **SFANC 硬选库单一架构**；连续权重/子滤波器/OCG 全删
+- **2026-08-25** 训练 7 类 CNN + 7 槽库 `data/wc_bank.bin`（CNN K=7 argmax 每秒选 1/7 槽 → crossfade 切换），库槽为离线合成收敛
+- **2026-09-02** 实测确认：离线生成的槽 1~6 幅度/相位不对，deploy 开环基本无效 → 转向**真机标定填库**：标定 = adapt 模式真机逐槽收敛（`GFANC_CAL_INDEX=k` 写槽 k，脚本 [calibrate_bank.ps1](../calibrate_bank.ps1) 逐槽自动跑）；deploy = CNN K=7 选槽开环
+- **误差麦定位不变**：只在标定用，部署态无误差麦纯开环（本路线 C 核心，始终成立）
+
+---
+
+## 12. 后续决策：马路噪声离线 NR 10→4dB 回归分析（2026-08-25，原独立文档并入）
+
+> 本节约自原 `docs/路线决策_真实噪声重训库与CNN对齐论文.md`（2026-08-25 决策准备记录）。目的：解释"为什么转硬选后马路噪声降噪从 ~10dB 掉到 ~4dB"，并给出两条候选路线。**实际落地选择了第三条——真机标定填库**（见 §11.1、[修复方案.md](修复方案.md)）。
+
+### 12.1 现象与根因
+
+| 分支 | 部署形态 | `road_noise-15.wav` 离线 NR_true | 250Hz 纯音离线 |
+|---|---|---|---|
+| `scenezone-anc`（旧） | 连续权重 Wc（CNN K=30 加权 15 子滤波器）→ 宽带可整形 | ~10dB（用户实测） | — |
+| `plan-c-dual-mode`（当前） | SFANC 硬选：CNN K=7 argmax 选 1/7 窄带槽 | ~4.7dB | 23.5dB |
+
+**根因**：连续权重可同时整形多个频带；硬选一次只消选中那 1 个窄带槽。`road_noise-15.wav` 频谱近均匀（7 带单带最高 ~22%），单窄带槽理想消音上限 ~1-2dB；250Hz 纯音能量集中在单带 → 硬选可消 20dB+（库槽本身工作正常）。**不是路径/带通/CNN 训练错误。**
+
+### 12.2 论文核实（SFANC-Window = 硬选架构，与部署形态一致）
+
+- `Control_filter_selection.py`：`ShuffleNetV2(num_classes=7)` → `argmax` 选 1/7 滤波器 → 每秒 1s 帧分类（与 1Hz CNN + 硬选同构）
+- 论文的 ~10dB 来自 **真实宽带噪声训练的槽 + 专用实时硬件 + 匹配的评估噪声**，不是架构差异
+- 开源仓库**只开源推理**；固定滤波器训练/CNN 训练循环/评估均未开源
+
+### 12.3 语料盘点（用户本地 `D:\Dataset\`）
+
+- `Synthetic_Dataset`：论文**合成**语料（75k 段 1s），标签在 CSV 外按 fc 分档，不能直接推类别
+- `Real_world_Dataset`：论文**真实世界**语料（7 语义类，~26h；`Training_data/` 63k 段带 `category` 语义列 + soft labels/gains）
+- **关键**：`raw/road` 宽带且可变 → **没有任何单条窄带槽能覆盖它主要能量**（带限切片方案只能到 5-7dB 的物理原因）
+
+### 12.4 候选路线与决策树
+
+| 路线 | 做法 | 预期 NR | CNN |
+|---|---|---|---|
+| A. 带限槽（论文字面） | 真实噪声按 7 带切片喂槽 | ~5-7dB | 不用改 |
+| B. 全频带 road 槽 | 喂 `raw/road` 全频带训 1 宽带槽 | 冲 ~10dB | 必须改（语义分类）|
+
+决策树要点：若"1 条 road 全频带槽"离线能回到 ~10dB → 架构/路径没毛病，问题在"槽没喂真实噪声"→ 再选 A/B；若回不到 → 先查硬件/增益/几何，别动 CNN。
+
+### 12.5 实际落地结论（2026-09-02）
+
+- **最小验证 → 路线 C 分支被采纳的实质**：验证了"标定后的槽在 deploy 开环确实能降噪"（250Hz 槽 0，anti 0.24 把 ch1-3 从 0.30 压到 0.12~0.15）→ 证明 **SFANC 开环成立的前提是槽 = 就地收敛的成品滤波器**（绝对增益烘焙）
+- 因此**没走 A/B 的离线重训**，而是走**真机标定 7 槽**（合成 WAV `band_0~6.wav` 作为标定信号 → 与 CNN 训练同分布，CNN 大概率不用重训）：流程见 [修复方案.md](修复方案.md)、脚本 [calibrate_bank.ps1](../calibrate_bank.ps1)
+- CNN 是否要重训的条件：若用真实录音标定（频谱与合成 WAV 不同分布）则需重训；用 `band_0~6.wav` 标定则一般不用

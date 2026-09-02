@@ -5,7 +5,9 @@
 > ① **算力够不够**（RK3568 能不能在 62.5µs 内跑完 8×8 FxLMS）
 > ② **算法在 ARM 上能收敛**（离线/实时 NR 和 PC 相当）
 > ③ **低延迟能不能到**（进阶，涉及焊接）
-> **配套规格**: [板级硬件定制需求_8S8E_闭环.md](板级硬件定制需求_8S8E_闭环.md)（最终定制板的目标）
+> **配套规格**: [板级硬件定制需求_8S8E_闭环.md](板级硬件定制需求_8S8E_闭环.md)（最终定制板的目标，含验收预算表）
+
+> ⚠️ **架构修订注（2026-09-02）**: 本文写于 2026-08-21，当时架构为回归 CNN 线（direct-weight / ocg.c）。2026-08-22 起现行架构 = **SFANC 硬选库**（offline 编译已无 `howling_detect.c`/`ocg.c`，改为 `scene_bank.c`；`main.c` 的 `windows.h` 已被 `#ifdef _WIN32` 包住，**无需删除**）。以下命令已按现行源码修订，NR 参考值需按现行库重标（见 §1.3 判定）。
 
 ---
 
@@ -45,17 +47,16 @@
 
 ### 1.3 编译离线版并跑基准（验证代码能移植）
 
-离线版 `main.c` 只在代码里多带了一句 `#include <windows.h>`（第 18 行，实际只用 `clock()`，来自 `<time.h>`）——**Linux 上删掉这一行即可编译**。
+> ✅ **2026-09-02 状态**: `main.c` 的 `#include <windows.h>` **已被 `#ifdef _WIN32` 包住**（[main.c:21-23](main.c#L21-L23)，仅 SetConsoleOutputCP 需要），Linux 编译自动跳过 → **无需再改任何一行**，直接编译即可。
 
 1. 拷贝仓库到板子（U 盘 / `git clone` / scp）。
-2. 改一行：删掉 [main.c:18](main.c#L18) 的 `#include <windows.h>`。
-3. 编译（注意没有 `-lole32`，那是实时版才需要）：
+2. 编译（注意没有 `-lole32`，那是实时版才需要；清单 = main.c 头注的现行依赖）：
    ```bash
    gcc -O2 -Iinclude main.c src/scene_controller.c src/fxnlms_mimo.c \
        src/fir_filter.c src/binary_loader.c src/cnn_m5_forward.c \
-       src/howling_detect.c src/ocg.c -lm -o main
+       src/scene_bank.c -lm -o main
    ```
-4. 跑三个标准基准，和 PC 的结果对比：
+3. 跑三个标准基准，和 PC 的结果对比：
    ```bash
    ./main "Noise Examples/road_noise_0-34.wav"
    ./main "Noise Examples/mixed_7types_56s.wav"   # 若文件在仓库里
@@ -63,11 +64,11 @@
    ```
 
 **判定标准**:
-- 三文件 NR_true 和 PC 一致（≈ +9.6 / +9.8 / +9.2dB）→ 代码移植无 bug ✅
+- **三文件 NR_true 与 PC 一致**（一致性是本步要验的，绝对值以 PC 为基准——现行 SFANC 硬选库的具体 NR 值取决于库槽与输入噪声匹配度，见 [README](../README.md)，**需先跑一次 PC 版取基准再对照**）→ 代码移植无 bug ✅
 - 处理速度：只要快于实时（处理时长 < 音频时长）就行，离线没实时约束
-- 编译报错：绝大多数是 Windows 残留符号，逐个删对应 `windows.h` 依赖即可
+- 编译报错：绝大多数是 Windows 残留符号，逐个清 `pa_loader.h`/`os_port.h` 等平台层依赖即可（`windows.h` 本身已隔离）
 
-> ✅ **已实测（2026-08-21）**: Linux ELF vs Windows PE，`road_noise_0-34` NR_true 平均 **14.7dB** 两侧一致，采样最大差 **1 LSB**（0.0031% FS），差异样本 anti 0.02% / err 0.3%——纯浮点库（MSVCRT vs glibc）舍入差异，无害。
+> ✅ **已实测（2026-08-21）**: Linux ELF vs Windows PE，`road_noise_0-34` NR_true 平均 **14.7dB** 两侧一致，采样最大差 **1 LSB**（0.0031% FS），差异样本 anti 0.02% / err 0.3%——纯浮点库（MSVCRT vs glibc）舍入差异，无害。该数值为 08-22 前回归 CNN 线的实测；现行硬选库的 NR_true 参考值需按上方"以 PC 为基准"重取。
 
 ### 1.3b 不买板子也能验证 ARM 正确性 — WSL 交叉编译 + QEMU（零成本）
 
@@ -80,7 +81,7 @@ apt update && apt install -y gcc-aarch64-linux-gnu qemu-user
 # 2) 交叉编译 offline 版为 aarch64 ELF:
 aarch64-linux-gnu-gcc -O2 -Iinclude main.c src/scene_controller.c \
     src/fxnlms_mimo.c src/fir_filter.c src/binary_loader.c \
-    src/cnn_m5_forward.c src/howling_detect.c src/ocg.c -lm -o /tmp/main_arm
+    src/cnn_m5_forward.c src/scene_bank.c -lm -o /tmp/main_arm
 
 # 3) 用 QEMU 用户态跑（-L 指定 ARM sysroot）:
 qemu-aarch64 -L /usr/aarch64-linux-gnu /tmp/main_arm "Noise Examples/road_noise_0-34.wav"
@@ -110,9 +111,8 @@ qemu-aarch64 -L /usr/aarch64-linux-gnu /tmp/main_arm "Noise Examples/road_noise_
 
 **这之后**，写个微基准上板跑，唯一目的是校准 NEON **实际效率**（静态算不出那个 50-80% 的乘子）。
 
-**先扩编译上限**（当前代码限制 2S/3E，目标 8×8）：
-- `include/scenezone_types.h`: `GFANC_E_MAX` 5→8、`GFANC_S_MAX` 4→8
-- 直接权重相关：`SC_DW_MAX` 30→120（文档 §4.8 已列，纯代码）
+**先扩编译上限**（当前代码 `GFANC_E_MAX 5 / GFANC_S_MAX 4`，目标 8×8，属远期板改动）：
+- `include/scenezone_types.h`: `GFANC_E_MAX` 5→8、`GFANC_S_MAX` 4→8（`SC_DW_MAX 30` 仍保留，但现行 SFANC 下仅作 CNN 类别/logits 输出上限、与直接权重无关，无需按 120 扩）
 
 **写一个微基准**（新建 `bench_fxlms.c`，示意）：
 ```c
@@ -166,7 +166,7 @@ int main(void) {
 
 ### 2.2 软件移植（这是主要工作量）
 
-项目审查报告已把移植拆成清单（R-21 HAL / R-19 atomic）：
+平台层移植要点如下（源自历史代码审查，细节见 [审查报告归档摘要](SceneZone_综合审查报告_合并版.md)）：
 
 | 改动点 | 现在（Windows） | 改成（Linux/ARM） | 涉及文件 |
 |---|---|---|---|
@@ -175,7 +175,7 @@ int main(void) {
 | **平台 HAL** | `gf_sleep_ms` / `GFANC_RDTSC`（x86 rdtsc） / `CreateThread` | `usleep` / `clock_gettime` / `pthread_create` | include 公共头 |
 | **类型** | `LONG`（Win32 int32） | `int32_t` / `atomic_int` | 公共头 |
 | **编译** | `gcc ... -lole32 -o scenezone_realtime.exe` | `-lpthread -latomic -lportaudio`，去掉 `-lole32` | Makefile |
-| 离线版 | `#include <windows.h>`（仅一行） | 删掉即可 | [main.c:18](main.c#L18) |
+| 离线版 | `#include <windows.h>` | **已隔离**（`#ifdef _WIN32`，[main.c:21-23](main.c#L21-L23)），无需改 | — |
 
 > ⚠️ 这是 1-2 周的工作量，对一个没写过 Linux 多线程的小白偏难。**如果卡住**，可以只做"原子操作 + DLL 加载"两个最小改动先跑通实时（其他用最简替代），或者请人做 BSP 移植（¥5-15k）。
 
@@ -248,7 +248,7 @@ RK3568 I2S/SAI (主控/时钟主)
 
 | 坑 | 现象 | 对策 |
 |---|---|---|
-| 代码在 Linux 编不过 | `windows.h` 报错 | 删 `#include <windows.h>`（main.c 第 18 行）；其余文件逐个清 |
+| 代码在 Linux 编不过 | `windows.h` / Win32 API 报错 | `main.c` 的已隔离（`#ifdef _WIN32`），无需改；其余文件清平台层依赖（`pa_loader.h`/`os_port.h`：`Interlocked*`→`<stdatomic.h>`、`gf_sleep_ms`/rdtsc 换 POSIX）|
 | 算力不够 | 微基准 tick > 62.5µs | 关在线Ŝ / 滑动和功率 / L=512 / 换 RK3588 |
 | 板子没有 I2S 引脚 | 找不到 pinout | 买前先查开发板规格，确认 I2S/SAI 引出 |
 | USB 声卡延迟大 | 宽带仍消不动 | 正常——USB 就是 ~8ms，这不是 bug |
