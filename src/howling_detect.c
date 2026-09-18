@@ -80,20 +80,21 @@ static float notch_apply(float x, float b1, float a1, float a2,
 /* ══════════════════════════════════════════════════════════
    初始化
    ══════════════════════════════════════════════════════════ */
-void howling_init(howling_detect_t *hw, int enabled)
+void howling_init(howling_detect_t *hw, int enabled, int actuate)
 {
     memset(hw, 0, sizeof(*hw));
     hw->enabled = enabled;
+    hw->actuate = actuate;
     if (enabled) dft_init();
 }
 
 /* ══════════════════════════════════════════════════════════
    检测一帧: DFT → 找峰值 → 判断是否为啸叫
-   thresh_db: 峰均值比阈值;  update_monitor: 是否更新 dominant_* 显示值
+   thresh_db: 峰均值比阈值;  mon_ch: 1=err 通道, 2=anti 通道, 0=不更新显示
    返回检测到的啸叫频率 (Hz), 0=无
    ══════════════════════════════════════════════════════════ */
 static float detect_frame(howling_detect_t *hw, const float *frame, float fs,
-                          float thresh_db, int update_monitor)
+                          float thresh_db, int mon_ch)
 {
     /* 计算所有 bin 功率 */
     float powers[HW_MAX_BIN + 1];
@@ -117,11 +118,26 @@ static float detect_frame(howling_detect_t *hw, const float *frame, float fs,
 
     float peak_db = 10.0f * log10f(peak_pwr / mean_pwr);
 
-    /* 更新监控数据 (仅 err 通道, 保持显示语义不变) */
-    if (update_monitor) {
+    /* 更新监控数据 (按通道; 两个通道都记, 见 howling_detect.h 里的说明) */
+    if (mon_ch == 1) {
         hw->dominant_freq = (float)peak_bin * fs / HW_FFT_N;
         hw->dominant_db   = peak_db;
+    } else if (mon_ch == 2) {
+        hw->anti_freq = (float)peak_bin * fs / HW_FFT_N;
+        hw->anti_db   = peak_db;
     }
+
+    /* 峰值必须离搜索带边缘 ≥HW_EDGE_GUARD 个 bin.
+       贴着带边的"峰"是搜索带的边界, 不是谐振 —— 激励整段落在检测带外时,
+       带内只剩裙边, 峰会被恒定钉在最低 bin, 那才是 125Hz 误插陷波的来源.
+       拦在这里, 而不是事后钳制陷波频率: 报一个我们不打算陷波的频率出去,
+       只会让候选计数器一直累加不到确认, 状态机语义变浑.
+       ⚠ 副作用 (2026-09-18 澄清): 本判断把**有效陷波落点**从搜索带 bin 8..24
+       (500-1500Hz) 收窄到 bin 10..22 = [625, 1375]Hz —— 见 howling_detect.h 里
+       HW_EDGE_GUARD 的说明. 按 500Hz 推理会高估本检测器的覆盖范围. */
+    if (peak_bin - HW_MIN_BIN < HW_EDGE_GUARD ||
+        HW_MAX_BIN - peak_bin < HW_EDGE_GUARD)
+        return 0;
 
     /* 峰值显著高于均值 → 候选啸叫 */
     if (peak_db > thresh_db)
@@ -204,15 +220,18 @@ void howling_tick(howling_detect_t *hw, float err_sample,
     }
     hw->buf_pos++;
 
-    /* 未满一帧, 仅做陷波 (如果有激活的) */
+    /* 未满一帧, 仅做陷波 (如果有激活的).
+       actuate=0 (标定期): 检测/状态机/日志照跑, 只是不碰输出 —— 见 howling_detect.h */
     if (hw->buf_pos < HW_FFT_N) {
-        for (int s = 0; s < S; s++) {
-            float x = anti_spk[s];
-            for (int i = 0; i < hw->active_count; i++)
-                x = notch_apply(x, hw->b1[i], hw->a1[i], hw->a2[i],
-                                &hw->x1[s][i], &hw->x2[s][i],
-                                &hw->y1[s][i], &hw->y2[s][i]);
-            anti_spk[s] = x;
+        if (hw->actuate) {
+            for (int s = 0; s < S; s++) {
+                float x = anti_spk[s];
+                for (int i = 0; i < hw->active_count; i++)
+                    x = notch_apply(x, hw->b1[i], hw->a1[i], hw->a2[i],
+                                    &hw->x1[s][i], &hw->x2[s][i],
+                                    &hw->y1[s][i], &hw->y2[s][i]);
+                anti_spk[s] = x;
+            }
         }
         return;
     }
@@ -240,7 +259,7 @@ void howling_tick(howling_detect_t *hw, float err_sample,
             float aframe[HW_FFT_N];
             memcpy(aframe, hw->abuf, HW_FFT_N * sizeof(float));
             apply_hanning(aframe, HW_FFT_N);
-            det_anti = detect_frame(hw, aframe, 16000.0f, HW_ANTI_THRESH_DB, 0);
+            det_anti = detect_frame(hw, aframe, 16000.0f, HW_ANTI_THRESH_DB, 2);
         }
     }
 
@@ -303,12 +322,14 @@ void howling_tick(howling_detect_t *hw, float err_sample,
     }
 
     /* ── 应用陷波器 (每扬声器独立 IIR 状态) ── */
-    for (int s = 0; s < S; s++) {
-        float x = anti_spk[s];
-        for (int i = 0; i < hw->active_count; i++)
-            x = notch_apply(x, hw->b1[i], hw->a1[i], hw->a2[i],
-                            &hw->x1[s][i], &hw->x2[s][i],
-                            &hw->y1[s][i], &hw->y2[s][i]);
-        anti_spk[s] = x;
+    if (hw->actuate) {
+        for (int s = 0; s < S; s++) {
+            float x = anti_spk[s];
+            for (int i = 0; i < hw->active_count; i++)
+                x = notch_apply(x, hw->b1[i], hw->a1[i], hw->a2[i],
+                                &hw->x1[s][i], &hw->x2[s][i],
+                                &hw->y1[s][i], &hw->y2[s][i]);
+            anti_spk[s] = x;
+        }
     }
 }

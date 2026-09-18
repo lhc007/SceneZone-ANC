@@ -109,6 +109,162 @@ static gfanc_config_t cfg = GFANC_CONFIG_DEFAULT;
    回调/主线程均只读 cfg.anc_mode (启动后不变, 与其它 cfg 读取同语义). */
 static int anc_fixed(void) { return cfg.anc_mode == 1; }
 
+/* 啸叫检测/陷波开关 —— 检测与施加自 2026-09-18 起解耦.
+   检测 (howling_enabled): adapt 默认关、deploy 默认开; env GFANC_HW_ENABLE 显式
+   覆盖两档. (2026-09-18 前该 env 被 adapt 的早退短路, 连 A/B 都做不了.)
+   施加 (howling_actuate): 只有 deploy 开; adapt 下即使检测打开也不下发陷波.
+   为何 adapt 默认关检测: 当时检测带 = bin 2..24 @62.5Hz = [125, 1500]Hz, 盖不住
+   band_0(50-81Hz) 与 band_1(81-132Hz) 的激励频段 —— 激励整段落在检测带以下, 带内
+   只剩带通裙边, "峰/均值比"失去物理意义. 实测 (export/verify_howling_band.py,
+   1875 帧/文件): band_0 99.5% 帧、band_1 92.7% 帧越过 anti 通道阈值 12dB, 峰值恒在
+   最低 bin(125Hz); 触发的是 anti 通道 (不打日志), 所以日志里 err 通道的 13.x dB
+   看着"没超"其实超的是它. 误插后该 IIR 陷波器 (f0=125Hz, r=0.96) 对 anti_spk 的
+   衰减是 band_0 −6.98dB、band_1 −22.48dB —— 正好砍在标定目标带上.
+   2026-09-18 注: HW_MIN_BIN 2→8 + HW_EDGE_GUARD 已让上述误报归零 (独立复现: 7 个
+   band 全 0/18750 帧越阈), 所以"必须关"的理由已弱化 —— 用 GFANC_HW_ENABLE=1 即可在
+   标定期把检测打开做 A/B. 但**陷波仍不下发**: 新落点 625-1375Hz 照样砍 band_4/5/6,
+   标定期间下发 = 自拆输出, 与旧 125Hz 误插是同一类错误. 检测开着就能看见谐振.
+   物理保护未减: deploy 侧照旧; 标定期另有电平/总量型兜底 (见 howling_detect.h 末). */
+static int howling_enabled(void)
+{
+    const char *s = getenv("GFANC_HW_ENABLE");
+    if (s) return atoi(s) != 0;              /* 显式覆盖: adapt/deploy 都生效 */
+    if (!anc_fixed()) return 0;              /* adapt(标定): 默认关 */
+    return HOWLING_ENABLED;
+}
+
+/* 陷波是否下发到 anti_spk. 0 = 只检测/计数/打日志, 不动输出.
+   adapt 恒 0: 标定期的任何陷波落点都在对消目标带内 (见上). 不带 env ——
+   标定期间没有任何理由下发陷波. */
+static int howling_actuate(void)
+{
+    if (!anc_fixed()) return 0;
+    return HOWLING_ENABLED;
+}
+
+/* ══════════════════════════════════════════════════════════
+   诊断: 16k 三路 WAV 转储 (env GFANC_DUMP_REF=<前缀>, 空=关)
+   ══════════════════════════════════════════════════════════
+   起因 (2026-09-18): 现在唯一的频谱读数 = howling_detect 的 anti 监视, 只覆盖
+   bin 8..24 @62.5Hz = [500, 1500]Hz —— 看不到 1750/2250/3250Hz 等更高谐波,
+   而"滋滋"的刺耳感多半来自那些. 已确证的只有"750Hz(250Hz 的 3 次谐波)是一条
+   相干谱线, 且发生在数字链路之后"(Wc 在 750Hz 只有 −67dB → 不是 DSP 造的).
+   是谁在失真 (放音喇叭 vs ANC 喇叭) 无法从现有日志分离, 于是把三路原样落盘:
+     <前缀>.ref.wav  = 参考麦原始电平 (抗混叠后, 未过 mic 增益/AGC/反馈抵消)
+                       —— 房间实际有什么, 也就是"喇叭实际发出了什么"
+     <前缀>.err.wav  = 误差麦 ch1 原始电平 (未过 mic 增益)
+     <前缀>.anti.wav = 实际送 DAC 的反噪 (out_gain/ramp 之后) —— ANC 喇叭被驱动的信号
+   三路是同一次运行同一批 16k 样本, 相位对齐 → 离线 FFT 可直接对比
+   "房间 vs ANC 输出"的谐波表, 并用 ANC 开/关两次运行分离两个喇叭的贡献.
+   注意: 回调里写盘非实时安全 (诊断专用). 不设置 env 时 g_dump_on=0, 只多一次分支. */
+#define DUMP_NCH 3
+static FILE *g_dump_f[DUMP_NCH];
+static long  g_dump_n[DUMP_NCH];
+static int   g_dump_on = 0;
+static const char *g_dump_tag[DUMP_NCH] = { "ref", "err", "anti" };
+
+static void dump_wav_header(FILE *f, unsigned long n)
+{
+    unsigned long data = n * 2, chunk = 36 + data, br = 16000UL * 2;  /* mono int16 @16k */
+    unsigned char h[44];
+    memcpy(h +  0, "RIFF", 4);
+    h[4]=(unsigned char)chunk; h[5]=(unsigned char)(chunk>>8);
+    h[6]=(unsigned char)(chunk>>16); h[7]=(unsigned char)(chunk>>24);
+    memcpy(h +  8, "WAVEfmt ", 8);
+    h[16]=16; h[17]=0; h[18]=0; h[19]=0;              /* fmt size 16 */
+    h[20]=1;  h[21]=0;                                 /* PCM */
+    h[22]=1;  h[23]=0;                                 /* mono */
+    h[24]=(unsigned char)16000; h[25]=(unsigned char)(16000>>8); h[26]=0; h[27]=0;
+    h[28]=(unsigned char)br; h[29]=(unsigned char)(br>>8);
+    h[30]=(unsigned char)(br>>16); h[31]=(unsigned char)(br>>24);
+    h[32]=2;  h[33]=0;                                 /* block align */
+    h[34]=16; h[35]=0;                                 /* bits */
+    memcpy(h + 36, "data", 4);
+    h[40]=(unsigned char)data; h[41]=(unsigned char)(data>>8);
+    h[42]=(unsigned char)(data>>16); h[43]=(unsigned char)(data>>24);
+    fseek(f, 0, SEEK_SET);
+    fwrite(h, 1, 44, f);
+}
+
+static void dump_wav_open(const char *prefix)
+{
+    char path[192];
+    for (int i = 0; i < DUMP_NCH; i++) {
+        snprintf(path, sizeof(path), "%s.%s.wav", prefix, g_dump_tag[i]);
+        g_dump_f[i] = fopen(path, "wb");
+        if (!g_dump_f[i]) {
+            fprintf(stderr, "[WARN] dump 打开失败: %s (目录不存在?) — 转储关闭\n", path);
+            for (int j = 0; j < i; j++) { fclose(g_dump_f[j]); g_dump_f[j] = NULL; }
+            return;
+        }
+        dump_wav_header(g_dump_f[i], 0);   /* 占位头, dump_wav_close 回填 */
+        g_dump_n[i] = 0;
+    }
+    g_dump_on = 1;
+    printf("  [DUMP] 16k WAV 转储开启: %s.{ref,err,anti}.wav (退出时回填头)\n", prefix);
+}
+
+/* 周期性把"已写样本数"回填进 WAV 头.
+   为何需要: 强杀 (Stop-Process -Force, 见 calibrate_bank.ps1 超时路径) 不给 fclose
+   机会, 只留一个 data size = 0 的占位头 → 离线工具读出来是 0 样本. 每秒回填一次,
+   最坏丢 1 秒, 而不是丢整个文件. 同样兜住 Ctrl+C 之外的任何非正常退出.
+   ⚠ 只能由**音频回调线程**调用 (见 dump_wav_tick) —— 见那里的竞争说明. */
+static void dump_wav_sync(void)
+{
+    if (!g_dump_on) return;
+    for (int i = 0; i < DUMP_NCH; i++) {
+        long pos;
+        if (!g_dump_f[i]) continue;
+        fflush(g_dump_f[i]);                  /* 数据先落盘, 再把头写回 */
+        pos = ftell(g_dump_f[i]);
+        dump_wav_header(g_dump_f[i], (unsigned long)g_dump_n[i]);
+        fseek(g_dump_f[i], pos, SEEK_SET);    /* 回到写位置继续追加 */
+    }
+}
+
+static void dump_wav_close(void)
+{
+    if (!g_dump_on) return;
+    dump_wav_sync();
+    for (int i = 0; i < DUMP_NCH; i++) {
+        if (!g_dump_f[i]) continue;
+        fclose(g_dump_f[i]);
+        g_dump_f[i] = NULL;
+        printf("  [DUMP] %s.wav: %ld 样本 (%.1f 秒)\n",
+               g_dump_tag[i], g_dump_n[i], (double)g_dump_n[i] / 16000.0);
+    }
+    g_dump_on = 0;
+}
+
+/* 1Hz 回填触发 —— 必须由音频回调线程调用 (与 dump_push 同线程).
+   为什么不能放主线程 (2026-09-18 实测踩过): 主线程 fflush/ftell/fseek 与回调的 fputc
+   竞争同一个 FILE* 的读写位置 → 每秒丢 1-2 个样本, int16 流错位, 落盘文件比
+   头里声明的短 (实测 ref −6 / err −2 / anti −5 字节). 更糟的是丢样本产生的阶跃
+   是宽频点击, 幅度恰好落在 −50~−60dB —— 正是要看的谐波梯子所在的量级, 会污染读数.
+   放在回调里 (每回调一次, 每 FS_ANC 样本才真回填) 就只剩单线程碰文件.
+   主线程只在流停止后 (cleanup) 调 dump_wav_close, 那时回调已停, 不构成竞争. */
+static long g_dump_sync_at = 0;
+
+static void dump_wav_tick(void)
+{
+    if (!g_dump_on) return;
+    if (g_dump_n[0] - g_dump_sync_at < FS_ANC) return;   /* 每 1 秒(16k样本)回填一次 */
+    g_dump_sync_at = g_dump_n[0];
+    dump_wav_sync();
+}
+
+static inline void dump_push(int i, float x)
+{
+    int v;
+    if (!isfinite(x)) x = 0.0f;
+    if (x >  1.0f) x =  1.0f;
+    if (x < -1.0f) x = -1.0f;
+    v = (int)(x * 32767.0f + (x >= 0.0f ? 0.5f : -0.5f));
+    fputc(v & 0xFF, g_dump_f[i]);
+    fputc((v >> 8) & 0xFF, g_dump_f[i]);
+    g_dump_n[i]++;
+}
+
 /* ── 算法常数 (非用户调节, 表达物理/设计约束) ── */
 #define WC_MUTE_DECAY   4e-5f   /* 静音期间 Wc 逐样本衰减因子 (半衰期~0.25s @16kHz) */
 #define OUT_GAIN_SLEW   0.004f  /* 输出增益包络 EMA 系数 (~4ms 时间常数) */
@@ -119,12 +275,12 @@ typedef struct {
     scene_ctrl_t  sc;
     fxnlms_mimo_t fx;
     fir_filter_t  bp_fir;        /* ref 带通 CNN (1024tap, 分类用) */
-    fir_filter_t  bp_fir_anc;    /* R-13: ref 带通 ANC (256tap, 群延迟8ms) */
-    fir_filter_t  bp_err[E];     /* err 带通 ANC (256tap) */
+    fir_filter_t  bp_fir_anc;    /* R-13: ref 带通 ANC (BP_ANC_LEN=64tap, 群延迟2ms) */
+    fir_filter_t  bp_err[E];     /* err 带通 ANC (BP_ANC_LEN=64tap) */
     fir_filter_t  bp_fx[E*S];    /* R-58-10: 梯度 Fx 带通, 每 (e,s) 独立 FIR (与 err_meas 同路径对齐) */
     fir_filter_t *sec_firs;      /* [E*S] 次级路径 */
     float        *sec_coeffs;
-    float        *bp_anc_coeffs; /* R-13: ANC 带通系数 (256tap, 与 CNN 1024tap 独立) */
+    float        *bp_anc_coeffs; /* R-13: ANC 带通系数 (BP_ANC_LEN=64tap, 与 CNN 1024tap 独立) */
 
     /* 反馈抵消 (逐扬声器独立 FIR, F-G修复) */
     fir_filter_t     fb_fir[GFANC_S_MAX];      /* [spk] 扬声器→参考麦反馈路径 FIR */
@@ -176,7 +332,13 @@ typedef struct {
     int    peak_hold_cnt;         /* anti峰值连续超限计数 (快检测safety_mute, 10样本=0.6ms触发) */
     volatile int peak_mute;       /* 峰值快检测触发静音 */
     int    peak_release_cnt;      /* peak_mute 释放迟滞: 连续低于阈值的样本数 (10ms 防抖) */
-    volatile int peak_rollback_cnt; /* peak_mute 上升沿 Wc 减半次数 (主线程显示) */
+    volatile int peak_rollback_cnt; /* peak_mute 上升沿次数 (adapt 下 Wc 减半, fixed 下仅静音) */
+    /* 输出余量观测 (2026-09-14): 软膝之前取样, 否则膝后恒 ≤1.0 什么也看不出.
+       离线算过 band_0.wav 的波峰因数是 4.13 (它是噪声带不是单音), 所以 anti RMS
+       0.25 就意味着峰值已到 1.0 —— 只看 RMS 会严重高估余量. 主线程每秒读后清零. */
+    volatile float anti_peak_hold;  /* 上一报告期内 anti 峰值 (软膝前, 含符号) */
+    volatile int   anti_knee_cnt;   /* 该期内触膝样本数 (|anti| > 0.9) */
+    volatile int   anti_knee_total; /* 该期样本次数 (= 回调数 × S), 作分母 */
     float  out_gain;              /* 静音包络 0..1 (slew~4ms, 替代硬切零, 消除开关咔哒声) */
     float  ref_env;               /* ref 包络 (~16ms), AGC 防饱和 */
     volatile LONG cold_hold;     /* cold start anti 硬限幅保护, 2s 后释放 */
@@ -309,7 +471,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* 带通滤波 (预增益已应用, 不造成反馈).
            R-13: CNN 和 ANC 使用不同长度的带通滤波器.
            CNN 保留 1024tap (分类需要频率分辨率),
-           ANC 使用 256tap (群延迟 32→8ms, 宽带 NR+3-5dB). */
+           ANC 使用 BP_ANC_LEN=64tap (群延迟 2ms, 砍环路延迟). */
         float ref_cnn = fir_tick(&ctx->bp_fir, ref_sample);
         float ref_anc = fir_tick(&ctx->bp_fir_anc, ref_sample);
 
@@ -338,7 +500,7 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             InterlockedDecrement(&ctx->fade_cnt);
         }
 
-        /* R-13: Fx = Ŝ ⊗ ref_anc (256tap 带通, 群延迟 8ms) — 仅闭环标定需要.
+        /* R-13: Fx = Ŝ ⊗ ref_anc (BP_ANC_LEN=64tap 带通, 群延迟 2ms) — 仅闭环标定需要.
            方案C deploy 开环物理无梯度链, Fx 计算整体跳过 (forward_rt_open 不需要 Fx). */
         float Fx_arr[E*S];
         if (!anc_fixed()) {
@@ -395,16 +557,29 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
            输出安全由 NaN 看门狗 + 软限幅 + cold-start ramp 兜底. */
         if (anc_fixed()) {
             fxnlms_forward_rt_open(&ctx->fx, ref_anc, anti_spk);
+        /* 2026-09-14: 本分支 = adapt 标定模式, 只保留电平型硬保护与冷启动.
+           啸叫 (hw.active_count>0) 与安静 (quiet_active) 两条判据已移出:
+           它们是为无人 deploy 调的阈值, 对 band_0/band_1 系统性误判, 且效果是
+           冻结梯度/衰减 Wc —— 与标定目标正相反. 连着毁掉两次槽 0 标定:
+             [NOTCH] (当时) 检测带下限 125Hz 高于 band_0(50-81)、band_1(81-132) 的
+                     激励频段, 带内只剩残渣, peak/mean 失去物理意义; 触发的是 anti
+                     通道 (HW_ANTI_THRESH_DB=12, 且不打日志).
+                     注: 该下限现已是 500Hz (HW_MIN_BIN=8), 此条只作历史.
+             [QUIET] 判据 err/ref>1.5 本意区分"深对消"与"噪声真停(约2.4)",
+                     但本机 ANC-off 时误差麦本就比参考麦高 2.4 倍(摆位/房间增益),
+                     两个特征值重合 —— 分不开"没在消音"和"没有噪声".
+           详见 docs/反馈抵消与库槽诊断_20260912/全槽重标定_执行步骤.md 第 4.1 节.
+           2026-09-14 补: 只拆判据不够 —— howling_tick 的 IIR 陷波器对 anti_spk 的施加
+           与调用方分支无关, 且 HOWLING_ENABLED 硬编码 1, 误插的 125Hz 陷波器照旧
+           砍目标带 (band_1 −22dB). 故 adapt 下陷波不再下发 (howling_actuate() 恒 0).
+           2026-09-18: 检测本身不再强制关 —— 检测与施加已解耦. adapt 下默认关检测
+           (howling_enabled()), 但可用 GFANC_HW_ENABLE=1 打开观测; 无论检测开关如何,
+           陷波都不会下发到 anti_spk. */
         } else if (ctx->fade_cnt > 0 || ctx->safety_mute || ctx->peak_mute
-            || ctx->quiet_active
-            || ctx->cold_hold > FS_ANC
-            || (HOWLING_ENABLED && ctx->hw.active_count > 0)) {
+            || ctx->cold_hold > FS_ANC) {
             fxnlms_forward_rt(&ctx->fx, ref_anc, Fx_arr, err_meas, anti_spk);
-            /* 静音/安静/啸叫期间 Wc 持续衰减 — 反馈事件/噪声消失后 Wc 自行退回到安全区.
-               P0-5: quiet_active 时冻结梯度 + 衰减 Wc → anti 平滑消退, 治"噪声消失后
-               嗡嗡声" (0.04 底噪不被当有效噪声持续降). */
-            if (ctx->safety_mute || ctx->peak_mute || ctx->quiet_active
-                || (HOWLING_ENABLED && ctx->hw.active_count > 0)) {
+            /* 电平型硬保护期间 Wc 持续衰减 — mute/削波后 Wc 自行退回安全区. */
+            if (ctx->safety_mute || ctx->peak_mute) {
                 const float dk = 1.0f - WC_MUTE_DECAY;  /* 半衰期~0.25s */
                 for (int i = 0; i < S*L; i++) ctx->fx.wc[i] *= dk;
             }
@@ -412,7 +587,10 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
             fxnlms_tick_rt(&ctx->fx, ref_anc, Fx_arr, err_meas, anti_spk);
             /* 在线 Ŝ 辨识: 利用 anti→err 关系跟踪次级路径变化.
                仅正常运行时更新 (非 mute/fade/howling/ramp).
-               anti 此时尚未钳位, err_meas 为带通信号, NLMS 无偏. */
+               ⚠ 2026-09-18: 原注释"anti 尚未钳位, err_meas 是带通, 故 NLMS 无偏"
+               是**错的** —— 无辅助噪声时它有偏, 而且偏到 Ŝ=0. 推导见
+               src/sec_online.c 头注. cfg.sec_online_mu 默认已改 0; 此调用保留
+               仅为复现该故障 (开启时 init 处会打 WARN). */
             if (cfg.sec_online_mu > 0 && ctx->ramp_cnt == 0)
                 sec_online_update(&ctx->sec_on, anti_spk, err_meas, ctx->sec_coeffs);
         }
@@ -441,15 +619,26 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         int nan_anti = 0;
         for (int s = 0; s < S; s++) {
             if (!isfinite(anti_spk[s])) { anti_spk[s] = 0.0f; nan_anti = 1; }
-            /* 输出软限幅(soft-knee)替代硬钳位 ±1.0 — 鲁棒性提升.
-               硬钳位把峰值削平 → 3/5/7 次谐波失真.
-               软膝: |x|≤0.9 线性不变, |x|>0.9 用 tanh 圆滑过渡到 ±1.0,
-               只去掉尖角高次谐波, 保留基波幅度 (膝点 C¹ 连续, 不引入新谐波).
-               (2026-08-17 实测 250Hz 滋滋并非削波所致, 此改动不治滋滋但更稳.) */
-            else if (anti_spk[s] > 0.9f)
-                anti_spk[s] = 0.9f + 0.1f * tanhf((anti_spk[s] - 0.9f) * 10.0f);
-            else if (anti_spk[s] < -0.9f)
-                anti_spk[s] = -0.9f - 0.1f * tanhf((-anti_spk[s] - 0.9f) * 10.0f);
+            else {
+                /* 输出余量观测: 必须在软膝**之前**取值. 膝后 |anti| 恒 ≤~1.0,
+                   峰值-限幅距离就永久看不出来了 —— 而那正是要量的事.
+                   分母用样本数(含未触膝的), 所以 knee% 是占比不是计数. */
+                float a = fabsf(anti_spk[s]);
+                if (a > ctx->anti_peak_hold) ctx->anti_peak_hold = a;
+                ctx->anti_knee_total++;
+                /* 输出软限幅(soft-knee)替代硬钳位 ±1.0 — 鲁棒性提升.
+                   硬钳位把峰值削平 → 3/5/7 次谐波失真.
+                   软膝: |x|≤0.9 线性不变, |x|>0.9 用 tanh 圆滑过渡到 ±1.0,
+                   只去掉尖角高次谐波, 保留基波幅度 (膝点 C¹ 连续, 不引入新谐波).
+                   (2026-08-17 实测 250Hz 滋滋并非削波所致, 此改动不治滋滋但更稳.) */
+                if (a > 0.9f) {
+                    ctx->anti_knee_cnt++;
+                    if (anti_spk[s] > 0.0f)
+                        anti_spk[s] =  0.9f + 0.1f * tanhf(( anti_spk[s] - 0.9f) * 10.0f);
+                    else
+                        anti_spk[s] = -0.9f - 0.1f * tanhf((-anti_spk[s] - 0.9f) * 10.0f);
+                }
+            }
         }
         if (nan_anti) {
             ctx->nan_out_hold++;
@@ -611,11 +800,21 @@ static int audio_cb(const void *input, void *output, unsigned long fcount,
         /* 累积实际输出功率 (mute/ramp之后, 反映真实扬声器输出) */
         ctx->acc_anti += anti_spk[0] * anti_spk[0] + anti_spk[1] * anti_spk[1];
 
+        /* 诊断转储: 三路 16k 同批样本 (ref=房间原始 / err=残差 / anti=送 DAC) —
+           见 dump_wav_* 顶部注释. ref/err 取原始电平 (不过增益/AGC), 便于离线对齐谐波表. */
+        if (g_dump_on) {
+            dump_push(0, ctx->ref_buf[n]);
+            dump_push(1, ctx->err_buf[n*E+0]);
+            dump_push(2, anti_spk[0]);
+        }
+
         ctx->anti_buf[n] = anti_spk[0];
         ctx->anti_buf[n + c16k] = anti_spk[1];
     }
     ctx->anti_spk_prev[0] = anti_spk[0];  /* 保存末值, 供下一回调首样本反馈抵消 */
     ctx->anti_spk_prev[1] = anti_spk[1];
+
+    dump_wav_tick();   /* 诊断转储: 1Hz 回填 WAV 头 — 必须在本(回调)线程内, 见其注释 */
 
     /* 快照 fx.wc → wc_snapshot: 主线程安全读取 (ARM float原子, 无撕裂) */
     memcpy(ctx->wc_snapshot, ctx->fx.wc, S*L*sizeof(float));
@@ -680,13 +879,24 @@ static BOOL WINAPI ctrl_handler(DWORD t) {
 /* ── 主循环辅助函数 (CR-4: 从 ~110 行 while 块拆分) ── */
 
 static void print_diagnostics(rt_ctx_t *ctx) {
-    char nr_str[20];
+    char nr_str[32];   /* 20 装不下 "NR=n/a(开环无误差麦)" (26 字节), 第 19 字节砍在 UTF-8 字符中间 */
     if (anc_fixed())
         snprintf(nr_str, sizeof(nr_str), "NR=n/a(开环无误差麦)");
     else if (ctx->diverged)
         snprintf(nr_str, sizeof(nr_str), "NR=DIV!(振荡)");
     else
         snprintf(nr_str, sizeof(nr_str), "NR=%.1fdB", ctx->nr_level);
+    /* 输出余量: 这是"还能承受多大室外噪声"的唯一直接读数.
+       不要拿 anti(RMS) 估余量 —— band_0 是噪声带不是单音, 波峰因数 4.13,
+       RMS 0.25 时峰值已经贴到 1.0; 只看 RMS 会把余量高估 12dB. */
+    {
+        float pk = ctx->anti_peak_hold;
+        int   kn = ctx->anti_knee_cnt, tot = ctx->anti_knee_total;
+        ctx->anti_peak_hold = 0.0f; ctx->anti_knee_cnt = 0; ctx->anti_knee_total = 0;
+        printf("       out: 峰值 %.3f (距膝点0.9 %+.1fdB)  触膝 %.3f%%\n",
+               pk, 20.0f * log10f(0.9f / (pk + 1e-9f)),
+               100.0f * (float)kn / (float)(tot > 0 ? tot : 1));
+    }
     if (anc_fixed())
         printf("[BANK] 类=%d/%d %s anti=%.4f%s%s%s%s gain=%.0fx cb=%d%s\n",
                ctx->deploy_class, (int)ctx->bank_n_slots, nr_str, ctx->anti_rms,
@@ -706,7 +916,11 @@ static void print_diagnostics(rt_ctx_t *ctx) {
                cfg.mic_pre_gain, ctx->callback_count,
                ctx->cnn_drop_cnt > 0 ? " [DROPS]" : "");
     if (ctx->peak_rollback_cnt > 0) {
-        printf("       ⚠ peak_mute 触发 %d 次 — Wc 已减半 (输出曾饱和)\n",
+        /* fixed/deploy 下 Wc 不减半 (见回调里 peak_mute 分支的 !anc_fixed() 守卫),
+           只静音 10ms. 旧文案无条件说"Wc 已减半", 在 fixed 下是假的. */
+        printf(anc_fixed()
+               ? "       ⚠ peak_mute 触发 %d 次 — 输出曾饱和 (fixed: Wc 未动, 仅静音)\n"
+               : "       ⚠ peak_mute 触发 %d 次 — Wc 已减半 (输出曾饱和)\n",
                ctx->peak_rollback_cnt);
         ctx->peak_rollback_cnt = 0;
     }
@@ -754,11 +968,19 @@ static void print_diagnostics(rt_ctx_t *ctx) {
     }
     if (ctx->fb_active)
         printf("       FB:  est=%.4f (反馈抵消量 RMS)\n", ctx->fb_rms);
-    if (ctx->hw.active_count > 0 || ctx->hw.dominant_db > HW_THRESH_DB * 0.7f)
-        printf("       HW:  f=%.0fHz peak=%.1fdB notches=%d%s\n",
+    /* err + anti 双通道: 真正触发陷波的是 anti, 只报 err 会让日志显示
+       "peak 没超" 却在插陷波 —— 2026-09-14 的诊断盲区, 两个都印.
+       [NOTCH] 只在陷波真下发时印 (actuate=1): adapt 下检测到谐振但不下发,
+       若照旧印 [NOTCH] 就是又一条"说了没做的事"的日志. */
+    if (ctx->hw.active_count > 0 ||
+        ctx->hw.dominant_db > HW_THRESH_DB * 0.7f ||
+        ctx->hw.anti_db     > HW_ANTI_THRESH_DB * 0.7f)
+        printf("       HW:  err f=%.0fHz peak=%.1fdB | anti f=%.0fHz peak=%.1fdB notches=%d%s\n",
                ctx->hw.dominant_freq, ctx->hw.dominant_db,
+               ctx->hw.anti_freq, ctx->hw.anti_db,
                ctx->hw.active_count,
-               ctx->hw.active_count > 0 ? " [NOTCH]" : "");
+               ctx->hw.active_count <= 0 ? ""
+                   : (ctx->hw.actuate ? " [NOTCH]" : " [谐振已确认·未下发]"));
 }
 
 static void check_wc_divergence(rt_ctx_t *ctx) {
@@ -898,6 +1120,14 @@ static void check_wc_stable_autosave(rt_ctx_t *ctx) {
                    "       已自动存库 %s 槽%d — deploy 模式自动加载, 可 Ctrl+C 退出\n",
                    WC_STABLE_RATIO * 100, WC_STABLE_SECS, rms, WC_GROW_FACTOR,
                    cfg.bank_file, cfg.cal_scene_index);
+            /* 自动退出 (GFANC_CAL_EXIT=1): exe 自身永不退出, calibrate_bank.ps1 的
+               `& $exe` 会永久阻塞在这一槽. stdout 重定向时是块缓冲, 脚本侧盯日志
+               等 [SAVE] 也不可靠 → 只能由 C 侧退出. */
+            if (cfg.cal_exit_after_save) {
+                printf("       GFANC_CAL_EXIT=1 → 自动退出 (脚本将启动下一槽)\n");
+                fflush(stdout);
+                ctx->running = 0;
+            }
         } else {
             fprintf(stderr, "[SAVE] 写库槽 %d 失败 (%s)\n", cfg.cal_scene_index, cfg.bank_file);
             ctx->wc_stable_sec = 0;
@@ -978,7 +1208,7 @@ int main(void) {
     int sec_len = bin_load_float(sec_file, &sec_path);
     printf("  Ŝ file: %s\n", sec_file);
     int bp_len  = bin_load_float("data/bandpass_fir.bin", &bp_coeff);
-    /* R-13: 尝试加载 ANC 专用短带通 (256tap). 无文件时截取 1024tap 前 256 点作为近似. */
+    /* R-13: 尝试加载 ANC 专用短带通 (BP_ANC_LEN=64tap). 无文件时截取 1024tap 前 BP_ANC_LEN 点作为近似. */
     float *bp_anc_coeff = NULL;
     int bp_anc_loaded = bin_load_float("data/bandpass_anc.bin", &bp_anc_coeff);
     int bp_anc_ok = (bp_anc_loaded >= BP_ANC_LEN);
@@ -1016,7 +1246,7 @@ int main(void) {
     ctx->bp_fir.delay_line = (gfanc_delay_t *)calloc(BP_LEN, sizeof(gfanc_delay_t));
     if (!ctx->bp_fir.delay_line) { fprintf(stderr, "OOM: bp_fir\n"); ret = 1; goto cleanup; }
 
-    /* ── R-13: ANC 带通 256tap (群延迟 32→8ms) ── */
+    /* ── R-13: ANC 带通 64tap (群延迟 1024tap 32ms → 2ms, 见 BP_ANC_LEN) ── */
     {
         float *anc_coeff = bp_anc_ok ? bp_anc_coeff : bp_coeff;  /* 回退: 1024tap 截断 */
         ctx->bp_fir_anc.coeffs = anc_coeff; ctx->bp_fir_anc.n_taps = BP_ANC_LEN;
@@ -1028,7 +1258,7 @@ int main(void) {
                BP_ANC_LEN, (BP_ANC_LEN-1)/(2.0f*FS_ANC)*1000.0f);
     }
 
-    /* ── R-13: 误差带通 256tap (ANC 通路, 与 ref_anc 一致) ── */
+    /* ── R-13: 误差带通 64tap (ANC 通路, 与 ref_anc 一致) ── */
     for (int e = 0; e < E; e++) {
         float *ec = bp_anc_ok ? bp_anc_coeff : bp_coeff;
         ctx->bp_err[e].coeffs = ec; ctx->bp_err[e].n_taps = BP_ANC_LEN;
@@ -1164,17 +1394,33 @@ int main(void) {
             }
         }
 
-    /* 在线 Ŝ 辨识: 从 anti_spk→err_mic 关系持续跟踪次级路径.
-       零探测噪声, 利用 ANC 自身输出作为激励. μ≈5e-6 极慢, 抗扰动偏差. */
+    /* 在线 Ŝ 辨识: 从 anti_spk→err_mic 关系跟踪次级路径. 零探测噪声.
+       ⚠ 默认关闭, 且**不应该**在 adapt 期打开 —— 2026-09-18 真机单变量 A/B 定案:
+       无辅助噪声时该辨识的稳态解不是 S, 而是 Ŝ ≡ 0. 因为激励 anti 与响应 err 里的
+       扰动 d 同源 (anti 恰恰是为对消 d 生成的):
+           E[e_id·anti]=0  ⟹  (Ŝ−S)⊛R_aa = R_da,  R_da = E[d·anti]
+           近完美对消时 S⊛anti ≈ −d  ⟹  R_da ≈ −S⊛R_aa  ⟹  Ŝ⊛R_aa = 0
+       **对消越好, Ŝ 越趋近 0** —— 不动点在 0, 与步长无关.
+       后果: Ŝ↓ → Fx_arr↓ → 梯度饿死 → 只剩 leak 衰减 Wc → Wc→0 → 输出归零.
+       保护栈全是"太响"型判据 (safety_mute err>8×ref / peak_mute |anti|>0.99 /
+       P0-4 要 anti_rms>0.25), 这条"静默自关"路径没有任何判据能看见.
+       实测 µ=5e-6: 90s 内 ch1 从 0.10 回到无控基线 0.25, NR 9.2→0.1;
+             µ=0: 同一 exe 稳定 5-8dB 实测降噪.
+       重开的前提是先实现辅助噪声注入并从 err 中减去 (教科书在线 SPM), 另立项. */
     if (cfg.sec_online_mu > 0) {
         if (sec_online_init(&ctx->sec_on, E, S, SEC_LEN, dsp_delay,
                              cfg.sec_online_mu) != 0) {
             fprintf(stderr, "OOM: sec_online\n"); ret = 1; goto cleanup;
         }
-        printf("  Online Ŝ: μ=%.0e (adaptive, zero probe noise)\n",
-               (double)cfg.sec_online_mu);
+        printf("  Online Ŝ: μ=%.0e\n", (double)cfg.sec_online_mu);
+        fprintf(stderr,
+            "\n[WARN] 在线 Ŝ 辨识已开启 (GFANC_SEC_MU=%.0e) —— 无辅助噪声时该辨识的\n"
+            "       稳态解是 Ŝ=0, 会在 ~1/(2µ)≈%.0fs 量级内把 Ŝ 拉低, 导致梯度饿死、\n"
+            "       ANC 静默自关 (ch1 回到无控基线, NR→0). 仅用于复现该故障,\n"
+            "       不要用于标定. 详见 src/sec_online.c 头注.\n\n",
+            (double)cfg.sec_online_mu, 1.0 / (2.0 * (double)cfg.sec_online_mu) / 16000.0);
     } else {
-        printf("  Online Ŝ: disabled (GFANC_SEC_MU=0)\n");
+        printf("  Online Ŝ: OFF (2026-09-18 定案: 无辅助噪声的在线辨识稳态解为 Ŝ=0)\n");
     }
 
     /* 反馈抵消: 逐扬声器加载 FIR (需先运行 calibrate_feedback.exe, F-G修复) */
@@ -1231,7 +1477,15 @@ int main(void) {
 
     /* scene_ctrl_init (决策层) 仅在 deploy 库加载段调用 (需 cnn_bank 的 K 信息);
        标定不初始化 CNN/决策层. */
-    howling_init(&ctx->hw, HOWLING_ENABLED);
+    {
+        int hw_on  = howling_enabled();
+        int hw_act = howling_actuate();
+        howling_init(&ctx->hw, hw_on, hw_act);
+        printf("  Howling: %s\n",
+               !hw_on ? "OFF  (GFANC_HW_ENABLE=1 可开)"
+                      : (hw_act ? "ON   (检测 + 陷波下发, deploy)"
+                                : "ON   (仅检测, 陷波不下发 — adapt 标定期)"));
+    }
     if (anc_fixed()) {
         /* 方案C deploy: 开环纯前向实例 — xd=NULL (省 E*S*L bytes), 无梯度链.
            fxnlms_forward_rt_open / set_wc / free 可用; 闭环函数不得调用 (会解引用 NULL xd). */
@@ -1342,6 +1596,9 @@ int main(void) {
     printf("  Ctrl+C to stop\n");
     printf("══════════════════════════════════════════\n\n");
 
+    /* 诊断转储 (env GFANC_DUMP_REF): 必须在 StartStream 之前开, 回调一起来就写 */
+    if (cfg.dump_prefix[0]) dump_wav_open(cfg.dump_prefix);
+
     p_Pa_StartStream(stream);
     printf("Running...\n");
 
@@ -1357,6 +1614,7 @@ int main(void) {
        标定 = 1Hz tick (安静/冻结/发散/收敛自动存槽/诊断). */
     int log_sec = 0;
     int cal_tick = 0;
+    int cal_secs_elapsed = 0;   /* GFANC_CAL_SECS: 标定墙钟秒计数 (adapt, 每 1Hz tick +1) */
     while (ctx->running) {
         gf_sleep_ms(100);  /* R-28: 可移植睡眠 */
         LONG ready = -1;
@@ -1484,6 +1742,26 @@ int main(void) {
                 check_wc_divergence(ctx);
                 check_convergence(ctx);
                 check_wc_stable_autosave(ctx);  /* Wc 收敛稳定 → 运行中自动存库槽 */
+
+                /* ── GFANC_CAL_SECS: 标定墙钟上限 (默认 0=关) ──
+                   跑满 N 秒主动退出 (running=0), 走的正是 Ctrl+C 那条结束路径:
+                   ret 仍为 0 → snapshot_capable 兜底把 last_good_wc 写库.
+                   为什么必须有: adapt 的收敛判据 (Wc 稳定 3s / NR≥3dB) 在真机上不必然
+                   触发 —— 2026-09-14 槽1 标定产出了正确的 band_1 解 (104Hz 单峰,
+                   pk/rms 4.9) 但两条判据都没报成功, 靠人手按 Ctrl+C 才存上.
+                   而 calibrate_bank.ps1 的超时是 Stop-Process -Force, 不给保存机会,
+                   照原样跑会把已收敛的好结果直接杀掉丢掉. 有 C 侧定时退出才真正无人值守.
+                   已运行中自动存过 (wc_autosaved) 就不必等满, 提前退. ── */
+                if (cfg.cal_secs > 0) {
+                    cal_secs_elapsed++;
+                    if (cal_secs_elapsed >= cfg.cal_secs || ctx->wc_autosaved) {
+                        printf("\n[CAL] 标定墙钟到点 (已跑 %ds / 上限 %ds%s) → 退出保存\n",
+                               cal_secs_elapsed, cfg.cal_secs,
+                               ctx->wc_autosaved ? ", 期间已自动存库" : "");
+                        fflush(stdout);
+                        ctx->running = 0;
+                    }
+                }
             }
 
             /* ── P0-5: 环境安静检测 (治"噪声消失后反相声残留/嗡嗡声") ──
@@ -1536,7 +1814,12 @@ int main(void) {
                        && (ctx->err_rms / (ctx->ref_rms + 1e-6f)) > cfg.quiet_err_ref
                        && ctx->quiet_since_active <= cfg.quiet_ref_memory
                        && ctx->ramp_cnt == 0 && ctx->cold_hold == 0
-                       && !ctx->safety_mute && !ctx->peak_mute) {
+                       && !ctx->safety_mute && !ctx->peak_mute
+                       /* 仅 deploy 开环有效 (2026-09-14): adapt=标定,
+                          闭环有误差麦可自适应, 不需要"噪声消失就退场"; 而该
+                          判据在本机 ANC-off 状态 (err/ref 约 2.4) 就成立,
+                          会把标定起点误判成噪声消失. 见派发块注释. */
+                       && anc_fixed()) {
                 if (++ctx->quiet_sec >= cfg.quiet_hold) {
                     ctx->quiet_sec = 0;
                     ctx->quiet_active = 1;
@@ -1566,14 +1849,21 @@ int main(void) {
         printf("[SAVE] 标定滤波器已在运行中自动保存 (库槽%d), 无需重复保存\n",
                cfg.cal_scene_index);
     } else if (ret == 0 && !anc_fixed() && ctx->snapshot_capable) {
-        int bank_ok = scene_bank_save_slot(cfg.bank_file, S, L, cfg.cal_scene_index, ctx->fx.wc);
-        printf("[SAVE] 已保存标定滤波器 → 库 %s 槽%d (%s) — deploy 模式自动加载\n",
+        /* 保存 last_good_wc (收敛那一刻的快照) 而非 fx.wc (当下这个):
+           fx.wc 可能已被此后的 mute/安静/啸叫衰减啃过 — 2026-09-14 槽 0 标定就是这么
+           被写坏的 (收敛时 Wc 范数 0.297, 退出时 0.024, 存进去的是尸体).
+           sm_check_convergence 每次判收敛都会刷新 last_good_wc, snapshot_capable
+           就是"它曾被刷新过"的标志, 故此处取用安全. ── */
+        int bank_ok = scene_bank_save_slot(cfg.bank_file, S, L, cfg.cal_scene_index,
+                                           ctx->last_good_wc);
+        printf("[SAVE] 已保存标定滤波器 (收敛快照) → 库 %s 槽%d (%s) — deploy 模式自动加载\n",
                cfg.bank_file, cfg.cal_scene_index, bank_ok == 0 ? "OK" : "FAIL");
     } else if (ret == 0 && !anc_fixed()) {
         printf("[SAVE] 跳过: 未检测到收敛 (NR 或 Wc 稳定均未达到), 未保存库槽\n");
     }
 
 cleanup:
+    dump_wav_close();   /* 诊断转储: 回填 WAV 头 + 关文件 (未开启时是空操作) */
     if (ctx) {
         FILE *lf = ctx->log_file;  /* R-10: free(ctx) 前取出, 避免 use-after-free */
         free(ctx->bp_fir.delay_line);

@@ -87,7 +87,10 @@ typedef struct {
     int   dsp_delay;             /* Ŝ 前补零延迟 (env: GFANC_DSP_DELAY) */
     int   embed_delay_ms;        /* 嵌入式信号链处理延迟 ADC+DSP+DAC (env: GFANC_EMBED_DELAY_MS, 默认0ms — R-58-8).
                                     离线 main.c pad Ŝ 模拟因果缺口; 0=实时PC等效(无处理延迟). */
-    float sec_online_mu;         /* 在线Ŝ辨识 NLMS 步长, 0=禁用 (env: GFANC_SEC_MU) */
+    float sec_online_mu;         /* 在线Ŝ辨识 NLMS 步长, 0=禁用 (env: GFANC_SEC_MU).
+                                    默认 0 (2026-09-18). 非 0 会在 ~1/(2µ) 秒内把
+                                    Ŝ 拉向 0 并静默关掉 ANC —— 仅用于复现该故障,
+                                    不要用于标定. 推导见 src/sec_online.c 头注. */
 
     /* 双模式 (SFANC 硬选库, 2026-08-21, 详见 docs/无误差麦方案_与SFANC对照_路线分析.md):
        anc_mode 0=adapt 标定闭环: 零启动 FxLMS + 误差麦, 收敛自动存库槽
@@ -105,6 +108,17 @@ typedef struct {
     int   bank_sim;            /* GFANC_BANK_SIM=1: 定时轮换类 (每 bank_sim_sec 秒), 验证
                                    切换无爆音 — 不依赖 CNN 分类 (Phase 2 决策层验证用) */
     int   bank_sim_sec;        /* SIM 轮换间隔秒 (env: GFANC_BANK_SIM_SEC, 默认 3) */
+    int   cal_exit_after_save; /* 标定自动退出 (env: GFANC_CAL_EXIT, 默认 0): 运行中
+                                  [SAVE] 写库成功后置 running=0 退出主循环, 供
+                                  calibrate_bank.ps1 逐槽自动标定 (exe 本身不自退,
+                                  脚本 `& $exe` 会永久阻塞; 且 stdout 重定向时是块缓冲,
+                                  脚本侧"盯日志等 [SAVE]"不可靠 → 只能由 C 侧退出) */
+    int   cal_secs;            /* 标定墙钟上限秒数 (env: GFANC_CAL_SECS, 默认 0=关).
+                                  跑满 N 秒后置 running=0 退出 → 走与 Ctrl+C 相同的
+                                  结束保存路径. 起因: adapt 的收敛判据 (Wc 稳定 3s) 在
+                                  真机上不必然触发, 而 calibrate_bank.ps1 超时是
+                                  Stop-Process -Force, 不给保存机会 → 好的标定结果被
+                                  杀掉丢弃. 有 C 侧定时退出才真正无人值守. */
 
     /* 环境安静检测 (P0-5, 治"噪声消失后反相声残留/嗡嗡声") 阶段③ 判据 (2026-08-11):
        唯一可靠信号 = 参考麦塌底 (ref<quiet_ref_max = 无真实噪声进参考麦). 深对消/
@@ -140,6 +154,12 @@ typedef struct {
                                   安静", 不判定噪声消失 — 防宽带弱噪声 (ref 一直低于门槛,
                                   如马路噪音 ref≈0.038) 被绝对阈值误判而砍掉反相 (env:
                                   GFANC_QUIET_MEMORY, 默认 20) */
+
+    /* 诊断转储 (2026-09-18, env: GFANC_DUMP_REF=<前缀>): 把回调里的三路 16k 信号
+       原样写成 WAV (<前缀>.ref.wav / .err.wav / .anti.wav), 供离线 FFT 分析谐波来源.
+       空串=关 (零开销). 起因: 现有频谱读数只覆盖 500-1500Hz, 看不到高次谐波.
+       实现见 main_realtime.c 的 dump_wav_open/dump_push. */
+    char  dump_prefix[96];
 } gfanc_config_t;
 
 /* 默认配置 (与当前 #define 一致)
@@ -163,11 +183,20 @@ typedef struct {
     0,                  /* embed_delay_ms (R-58-8: 默认0 — 训练世界无此延迟! 3ms 加在 Ŝ 上
                            → anti 相位错位 48 样本 → 自适应正反馈发散; 需评估嵌入式目标时
                            GFANC_EMBED_DELAY_MS 显式开启) */ \
-    5e-6f,              /* sec_online_mu (在线Ŝ辨识步长, 0=禁用) */ \
+    0.0f,               /* sec_online_mu (在线Ŝ辨识 NLMS 步长, 0=禁用).
+                           2026-09-18 由 5e-6 改为 0: 真机单变量 A/B 定案 ——
+                           无辅助噪声时该辨识的稳态解是 Ŝ=0 (推导见 src/sec_online.c
+                           头注), 一旦开启则 Ŝ↓ → Fx_arr(=Ŝ⊛ref)↓ → FxLMS 梯度饿死
+                           → 只剩 leak 吃 Wc → Wc→0 → 输出归零, 且保护栈里没有
+                           任何"输出归零"判据能看见. 实测 µ=5e-6: 90s 内 NR 9.2→0.1,
+                           误差麦回到无控基线; µ=0: 同一 exe 稳定 5-8dB 实测降噪.
+                           µ 只决定走向 0 的快慢 (τ≈1/(2µ)), 不动不动点, 故调参无解.
+                           重开需先实现辅助噪声注入 (教科书在线 SPM), 见 sec_online.c. */ \
     0,                  /* anc_mode (双模式: 0=adapt 闭环标定, 1=fixed 开环µ=0 部署.
                            GFANC_ANC_MODE=adapt|fixed) */ \
-    2, "data/wc_bank.bin", 0, 0, 3, /* bank_hold_frames(2), bank_file, cal_scene_index(0),
-                           bank_sim(0), bank_sim_sec(3).
+    2, "data/wc_bank.bin", 0, 0, 3, 0, 0, /* bank_hold_frames(2), bank_file, cal_scene_index(0),
+                           bank_sim(0), bank_sim_sec(3), cal_exit_after_save(0),
+                           cal_secs(0=关 — 缺省不改既有 adapt 行为, 脚本显式开).
                            SFANC 硬选库决策层: 分类防抖 + 库路径 + 标定槽索引 */ \
     0.02f, 8.0f, 3, 1.5f, 0.042f, 1.5f, 0.05f, 2.0f, 20, /* quiet_anti_rms, quiet_nr_db(弃用),
                            quiet_hold, quiet_exit, quiet_ref_max, quiet_err_ref,
@@ -175,6 +204,7 @@ typedef struct {
                            P0-5 阶段④: anti>0.02 且 ref<0.042 且 err_ref>1.5 且"ref 曾于
                            quiet_ref_memory 秒内高于门槛" 持续 3s → 判定噪声消失 → 冻结+衰减 Wc.
                            退出: ref 重回 1.5× 或 err 重回 2.0× 安静基准 → 重建. */ \
+    ""                  /* dump_prefix: 16k 三路 WAV 转储前缀 (env GFANC_DUMP_REF), 空=关 */ \
 }
 
 /* 从环境变量覆盖可调参数 (GFANC_MIC_GAIN, GFANC_STEP 等) */
@@ -212,6 +242,11 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
         cfg->bank_sim = atoi(s) != 0 ? 1 : 0;
     }
     if ((s = getenv("GFANC_BANK_SIM_SEC"))) cfg->bank_sim_sec = atoi(s);
+    if ((s = getenv("GFANC_CAL_EXIT")))  cfg->cal_exit_after_save = atoi(s) != 0 ? 1 : 0;
+    if ((s = getenv("GFANC_CAL_SECS"))) {
+        cfg->cal_secs = atoi(s);
+        if (cfg->cal_secs < 0) cfg->cal_secs = 0;   /* 负值等于关 */
+    }
     if ((s = getenv("GFANC_QUIET_ANTI"))) cfg->quiet_anti_rms = (float)atof(s);
     if ((s = getenv("GFANC_QUIET_NR")))   cfg->quiet_nr_db    = (float)atof(s);
     if ((s = getenv("GFANC_QUIET_HOLD"))) cfg->quiet_hold     = atoi(s);
@@ -221,6 +256,9 @@ static void gfanc_config_load_env(gfanc_config_t *cfg) {
     if ((s = getenv("GFANC_QUIET_ERR_EXIT"))) cfg->quiet_err_exit = (float)atof(s);
     if ((s = getenv("GFANC_QUIET_ERR_REF"))) cfg->quiet_err_ref  = (float)atof(s);
     if ((s = getenv("GFANC_QUIET_MEMORY"))) cfg->quiet_ref_memory = atoi(s);
+    if ((s = getenv("GFANC_DUMP_REF"))) {
+        snprintf(cfg->dump_prefix, sizeof(cfg->dump_prefix), "%s", s);
+    }
     /* wc_gain 已移除: Wc RMS 始终按 stub_rms×1.0 构造, LMS 自适应收敛到正确增益 */
     /* if ((s = getenv("GFANC_WC_GAIN"))) cfg->wc_gain = (float)atof(s); */
 }

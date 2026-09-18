@@ -201,6 +201,11 @@ gcc -O2 -Iinclude main.c src/scene_controller.c src/scene_bank.c src/fxnlms_mimo
 ```powershell
 $env:GFANC_ANC_MODE='adapt'   # 锁标定（默认虽是 adapt，但 4.2 的 fixed 会残留，见 4.2 注意事项）
 .\scenezone_realtime.exe
+
+
+cd D:\VSCodeRepository\SceneZone-ANC
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\calibrate_bank.ps1 -OnlySlot 0 -InDev 23 -OutDev 23
 ```
 
 - 播放稳态噪声（如白噪、粉噪、马路噪音，或 `data/synth_noise/band_k.wav`）
@@ -218,6 +223,27 @@ $env:GFANC_ANC_MODE='fixed'
 - 每秒 log 会显示 `[BANK] 类=k/7`
 
 > ⚠️ `GFANC_ANC_MODE='fixed'` 会**一直残留**在当前 PowerShell 窗口。之后再跑 4.1 / 方法 B 标定前，先执行 `Remove-Item Env:GFANC_ANC_MODE`（或直接新开一个窗口），否则裸命令会静默跑成部署模式。
+
+#### 4.3 离线评估（可选，不需要任何硬件）
+
+前提：已按 3.2 编译出 `main.exe`。加载整库 `data/wc_bank.bin` + `data/cnn_bank_*.bin`，**1Hz 分类 CNN argmax → 防抖 → 选槽 crossfade**，纯前向无梯度——与 4.2 部署态决策层同构，只是噪声换成 WAV 文件。
+
+```powershell
+./main.exe "Noise Examples/road_noise_0-34.wav"   # 逐秒打印 [BANK] 类 k/N (filter k, slot k, fade)
+./main.exe "Noise Examples/road_noise-15.wav"
+./main.exe "Noise Examples/tone250_30s.wav"
+```
+
+```powershell
+$env:GFANC_FORCE_CLASS='2'   # 强制静态槽 2 — 量化"选错槽"的代价（开环错选 = 反相更差）
+$env:GFANC_BANK_SIM='1'      # 每 GFANC_BANK_SIM_SEC 秒轮换一槽（默认 3）— 验证切换无爆音，不依赖 CNN
+$env:GFANC_EMBED_DELAY_MS='3'  # 模拟嵌入式 3ms 处理延迟（默认 0；离线世界无此延迟）
+Remove-Item Env:GFANC_FORCE_CLASS, Env:GFANC_BANK_SIM, Env:GFANC_EMBED_DELAY_MS -ErrorAction SilentlyContinue
+```
+
+- 日志读法：`[BANK] 类 k/N` 逐秒稳定 = 选类正确；类变时看有无爆音。
+- `NR_true` 由主路径模型（Pri）合成误差算出，**只反映"选类是否正确 + 槽与噪声谱的匹配度"**，不等于实机部署降噪量（部署态无误差麦、无 NR 指标）。
+- **开环硬选特性**：库槽匹配才有降噪，选错槽反相更差——决策层的价值就在"选对槽"。
 
 ---
 

@@ -3,13 +3,41 @@
  *  Identifies Ŝ(e,s) = speaker[s] → error_mic[e] acoustic transfer function.
  *
  *  Uses anti_spk (ANC output driving speakers) as excitation and err_mic
- *  (bandpassed error microphone) as response.  No probe noise required:
- *  anti_spk is broadband whenever the environment has noise in the ANC band,
- *  and disturbance residual acts as dither that averages out over time.
+ *  (bandpassed error microphone) as response.
  *
- *  μ ≈ 5e-6 means each Ŝ tap changes by ~5e-8 per sample at typical levels,
- *  i.e. ~0.1% per second — slow enough that anti↔disturbance correlation
- *  (which would bias the Ŝ estimate) decorrelates over minutes of operation.
+ *  ══════════════════════════════════════════════════════════════════════════
+ *  ⚠⚠ 2026-09-18 真机单变量 A/B 定案: 无辅助噪声时本辨识**不可用** ——
+ *  它的稳态解不是 S, 而是 Ŝ ≡ 0.
+ *
+ *  原注释称 "disturbance residual acts as dither that averages out over time",
+ *  该论断是错的: ANC 收敛后残差里**没有**不相关的 dither, 剩下的恰恰就是与
+ *  anti 相关的那一部分 (因为 anti 就是为对消它而生成的).
+ *
+ *  推导 (NLMS 稳态: 残差与激励正交):
+ *      e_id = err − Ŝ⊛anti,   err = d + S⊛anti
+ *      E[e_id·anti] = 0  ⟹  (Ŝ − S)⊛R_aa = R_da,   R_da = E[d·anti]
+ *      近完美对消时 S⊛anti ≈ −d  ⟹  R_da ≈ −S⊛R_aa
+ *      ⟹  Ŝ⊛R_aa = 0  ⟹  Ŝ ≡ 0
+ *  **对消越好, Ŝ 越趋近 0** —— 不动点在 0, 与步长无关.
+ *
+ *  后果链: Ŝ↓ → Fx_arr(=Ŝ⊛ref)↓ → FxLMS 梯度饿死 → 只剩 leak 在衰减 Wc
+ *  → Wc→0 → 输出归零 → 误差麦回到无控基线. 而保护栈全是"太响"型判据
+ *  (safety_mute: err_rms>8×ref; peak_mute: |anti|>0.99; P0-4: 要 anti_rms>0.25),
+ *  没有任何一条能看见"静默自关"这条路径.
+ *
+ *  实测 (同一 exe, 只改 GFANC_SEC_MU, 90s adapt):
+ *      µ=5e-6 → NR 峰值 9.2 → 末段 0.1;  ch1 从 0.10 回到 0.24~0.27 (无控基线 0.25)
+ *      µ=0    → NR 稳定 9.2~12.8;        ch1 稳在 0.11~0.18 (= ~6dB 实测降噪)
+ *  存入库槽的 Wc RMS 也从 0.010/0.016 变回 0.017/0.021 (µ=5e-6 存的是个 −3.4dB 缩水成品).
+ *
+ *  收敛速率: τ ≈ 1/(2µ) 样本 (归一化 NLMS). µ=5e-6 @16kHz → 6.3s,
+ *  所以 90s 的标定窗口足以走完这条路. 降低 µ 只减慢走向 0, 不移动不动点 ——
+ *  **这不是调参问题**.
+ *
+ *  正确的修法是注入辅助噪声 (auxiliary noise / probe signal) 并从 err 中
+ *  减去其对消分量 —— 教科书在线 SPM 的标准做法. 在那之前本模块默认禁用
+ *  (gfanc_config_t.sec_online_mu = 0).
+ *  ══════════════════════════════════════════════════════════════════════════
  */
 
 #include <stdlib.h>
